@@ -27,11 +27,12 @@
            <option value="name_asc">按姓名 A→Z</option>
          </select>
        </div>
-       <div class="right">
-         <button id="investigateBtn" class="btn">发起调查</button>
-         <span id="count" class="badge">0 人</span>
-         <span class="badge">点击行查看详情</span>
-       </div>
+        <div class="right">
+          <button id="investigateBtn" class="btn">发起调查</button>
+          <button id="exportJsonBtn" class="btn">导出 JSON</button>
+          <span id="count" class="badge">0 人</span>
+          <span class="badge">点击行查看详情</span>
+        </div>
       </div>
 
     <div id="app"><div class="loading">加载中...</div></div>
@@ -75,8 +76,10 @@
     const sortSel = document.getElementById('sort');
     const countBadge = document.getElementById('count');
     const investigateBtn = document.getElementById('investigateBtn');
+    const exportJsonBtn = document.getElementById('exportJsonBtn');
 
     let allPeople = [];
+    let lastPeopleItems = [];
 
     function getApiKey() {
       return sessionStorage.getItem('api_key') || '';
@@ -220,11 +223,35 @@
         if (!res.ok) throw new Error(`API 错误: ${res.status}`);
         const data = await res.json();
 
+        lastPeopleItems = Array.isArray(data.items) ? data.items : [];
         allPeople = (data.items || []).map(p => normalizePerson(p));
         render();
       } catch (err) {
         app.innerHTML = `<div class="error">加载失败：${err.message}</div>`;
       }
+    }
+
+    function ts() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    }
+
+    function downloadText(filename, text, mime) {
+      const blob = new Blob([text], { type: mime || 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function downloadJson(filename, obj) {
+      const text = JSON.stringify(obj, null, 2);
+      downloadText(filename, text, 'application/json;charset=utf-8');
     }
 
     function normalizePerson(p) {
@@ -343,6 +370,20 @@
       startInvestigateFlow().catch(err => {
         app.innerHTML = `<div class="error">任务启动失败：${err.message}</div>`;
       });
+    });
+
+    exportJsonBtn.addEventListener('click', () => {
+      const q = (qInput.value || '').trim();
+      const sort = (sortSel.value || '').trim();
+      const meta = {
+        exported_at: new Date().toISOString(),
+        query: q || null,
+        sort: sort || null,
+        count: Array.isArray(lastPeopleItems) ? lastPeopleItems.length : 0,
+        items: Array.isArray(lastPeopleItems) ? lastPeopleItems : [],
+      };
+      const name = `people_${ts()}.json`;
+      downloadJson(name, meta);
     });
 
     loadPeople();

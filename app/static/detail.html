@@ -12,6 +12,7 @@
       <a class="back" href="index.html">← 返回榜单</a>
       <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
         <span id="meta" class="badge">加载中...</span>
+        <button id="downloadJsonBtn" class="btn">下载 JSON</button>
         <button id="themeBtn" class="btn">切换主题</button>
       </div>
     </div>
@@ -37,8 +38,11 @@
 
     const app = document.getElementById('app');
     const meta = document.getElementById('meta');
+    const downloadJsonBtn = document.getElementById('downloadJsonBtn');
     const params = new URLSearchParams(location.search);
     const name = params.get('name');
+
+    let lastPerson = null;
 
     if (!name) {
       app.innerHTML = '<div class="error">缺少参数：name</div>';
@@ -52,6 +56,7 @@
         const res = await fetch(`/api/people/${encodeURIComponent(name)}`);
         if (!res.ok) throw new Error(`API 错误: ${res.status}`);
         const data = await res.json();
+        lastPerson = data;
         meta.textContent = `api/people/${name}`;
         render(data);
       } catch (err) {
@@ -59,6 +64,39 @@
         meta.textContent = 'error';
       }
     }
+
+    function sanitizeFilename(s) {
+      return String(s || 'unknown').replace(/[\\/:*?"<>|]/g, '_').trim() || 'unknown';
+    }
+
+    function ts() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    }
+
+    function downloadText(filename, text, mime) {
+      const blob = new Blob([text], { type: mime || 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function downloadJson(filename, obj) {
+      const text = JSON.stringify(obj, null, 2);
+      downloadText(filename, text, 'application/json;charset=utf-8');
+    }
+
+    downloadJsonBtn.addEventListener('click', () => {
+      if (!lastPerson) return;
+      const base = sanitizeFilename(lastPerson.name || name);
+      downloadJson(`${base}.person_${ts()}.json`, lastPerson);
+    });
 
     function render(person) {
       const p = person || {};

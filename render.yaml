@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: world-model
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DEFAULT_RECENT_YEARS
+        value: 2
+      - key: MAX_CONCURRENT_JOBS
+        value: 2
+      - key: IP_COOLDOWN_SEC
+        value: 10
+      - key: OPENALEX_PER_PAGE
+        value: 25
+      - key: OPENALEX_MAX_PAGES_PER_KEYWORD
+        value: 5
+      - key: OPENALEX_MAX_TOTAL_PAGES
+        value: 12
+      - key: OPENALEX_MAX_TOTAL_WORKS
+        value: 1200
+      - key: OPENALEX_EARLY_STOP_CN_MULT
+        value: 1
