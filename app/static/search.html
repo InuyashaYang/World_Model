@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>搜索调查</title>
+  <link rel="stylesheet" href="theme.css">
+</head>
+<body class="wm-page">
+  <div class="wm-shell">
+    <aside class="wm-side">
+      <div class="wm-side-top">
+        <div class="wm-brand">
+          <div class="wm-brand-title">Deep Research Workbench</div>
+          <div class="wm-brand-sub">Topic → OpenAlex → DeepResearch → Profile</div>
+        </div>
+        <button id="themeBtn" class="btn">切换主题</button>
+      </div>
+
+      <div class="wm-nav">
+        <button id="modeTopic" class="wm-nav-item is-active" type="button">主题流水线</button>
+        <button id="modePerson" class="wm-nav-item" type="button">人物深搜</button>
+      </div>
+
+      <div class="wm-side-section">
+        <div class="wm-side-h">Sessions</div>
+        <div id="sessionList" class="wm-topic-list">
+          <div class="muted" style="padding:10px;">暂无</div>
+        </div>
+        <div class="wm-side-h" style="margin-top:12px;">主题结果历史</div>
+        <div id="topicList" class="wm-topic-list">
+          <div class="muted" style="padding:10px;">加载中...</div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="wm-main">
+      <div class="wm-main-head">
+        <div class="wm-main-title">工作区</div>
+        <div class="wm-main-meta" id="wmModeHint">主题流水线：输入一段调研需求</div>
+      </div>
+
+      <div id="workspace" class="wm-chat"></div>
+
+      <div class="wm-composer" style="position:relative;">
+        <div id="runningOverlay" class="wm-input-overlay" style="display:none;">
+          <div class="muted"><span class="mono">Job is running...</span></div>
+          <button id="btnFastProfile" class="btn" style="border-color:var(--accent); color:var(--accent); display:none;">
+            ⚡ 用当前 DeepResearch 直接生成 Profile
+          </button>
+          <button id="btnCancel" class="btn" style="color:var(--danger); border-color:var(--danger);">
+            停止
+          </button>
+        </div>
+
+        <div class="wm-composer-row">
+          <input id="apiKey" class="input" placeholder="API Key（仅保存在浏览器会话）" />
+          <label class="wm-checkbox"><input id="deep" type="checkbox" /> 额外综述</label>
+        </div>
+        <div class="wm-composer-row">
+          <textarea id="q" class="input" rows="4" placeholder="输入调研需求（纯文字）：\n建议包含：主题/定义、时间范围、排除项、子方向。"></textarea>
+          <button id="send" class="btn">发送</button>
+        </div>
+        <div class="muted" style="padding:6px 2px 0;">提示：完成后可一键跳转到 index.html 查看完整 profile 大表（复用现成榜单页）。</div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Need-input Modal -->
+  <div id="wmModal" class="wm-modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="wm-modal">
+      <h3 id="wmModalTitle">需要补充信息</h3>
+      <div class="wm-modal-body">
+        <div id="wmModalDesc" class="muted" style="margin:0 0 10px; white-space:pre-wrap;"></div>
+        <textarea id="wmModalInput" class="input" rows="6" placeholder="请补充说明..."></textarea>
+      </div>
+      <div class="wm-modal-actions">
+        <button id="wmModalCancel" class="btn" type="button">按默认继续</button>
+        <button id="wmModalOk" class="btn" type="button">提交并继续</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Readonly Modal for candidates -->
+  <div id="wmListModal" class="wm-modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true" style="z-index:60;">
+    <div class="wm-modal" style="width:min(980px, 96%); height:80vh; display:flex; flex-direction:column;">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; padding:0 6px;">
+        <h3 id="wmListTitle" style="margin: 6px 0 10px; color: var(--accent2); font-size: 1.05rem;">列表</h3>
+        <button id="wmListClose" class="btn" type="button">关闭</button>
+      </div>
+      <div style="padding:0 6px 10px;">
+        <input id="wmListSearch" class="input" placeholder="过滤（姓名/关键词）..." style="width:100%; min-width:0;" />
+      </div>
+      <div id="wmListBody" style="flex:1; overflow:auto; padding:6px; border:1px solid var(--border); border-radius:12px; background: var(--panel2);"></div>
+    </div>
+  </div>
+
+  <script>
+    // ----------------------------
+    // Theme
+    // ----------------------------
+    const root = document.documentElement;
+    const themeBtn = document.getElementById('themeBtn');
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light' || saved === 'dark') root.setAttribute('data-theme', saved);
+    else root.setAttribute('data-theme', 'light');
+    themeBtn.addEventListener('click', () => {
+      const cur = root.getAttribute('data-theme') || 'light';
+      const next = cur === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+    });
+
+    // ----------------------------
+    // Utils
+    // ----------------------------
+    function esc(s){
+      return String(s ?? '')
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;')
+        .replaceAll("'", '&#039;');
+    }
+    function nowTs(){ return Date.now(); }
+    function fmtTime(ts){
+      try { return new Date(ts).toLocaleString(); }
+      catch(_) { return ''; }
+    }
+
+    // ----------------------------
+    // DOM
+    // ----------------------------
+    const workspace = document.getElementById('workspace');
+    const topicListEl = document.getElementById('topicList');
+    const sessionListEl = document.getElementById('sessionList');
+    const wmModeHint = document.getElementById('wmModeHint');
+
+    const apiKeyInput = document.getElementById('apiKey');
+    const deepCb = document.getElementById('deep');
+    const qInput = document.getElementById('q');
+    const sendBtn = document.getElementById('send');
+
+    const runningOverlay = document.getElementById('runningOverlay');
+    const btnFastProfile = document.getElementById('btnFastProfile');
+    const btnCancel = document.getElementById('btnCancel');
+
+    const modeTopicBtn = document.getElementById('modeTopic');
+    const modePersonBtn = document.getElementById('modePerson');
+
+    // candidates modal
+    const listModal = document.getElementById('wmListModal');
+    const listTitle = document.getElementById('wmListTitle');
+    const listBody = document.getElementById('wmListBody');
+    const listSearch = document.getElementById('wmListSearch');
+    const listClose = document.getElementById('wmListClose');
+    listClose.addEventListener('click', () => listModal.classList.remove('is-open'));
+
+    // ----------------------------
+    // API key storage
+    // ----------------------------
+    function getApiKey(){ return sessionStorage.getItem('api_key') || ''; }
+    function setApiKey(v){ if(!v) sessionStorage.removeItem('api_key'); else sessionStorage.setItem('api_key', v); }
+    apiKeyInput.value = getApiKey();
+    apiKeyInput.addEventListener('input', () => setApiKey(apiKeyInput.value.trim()));
+
+    // ----------------------------
+    // Sessions
+    // ----------------------------
+    const SESSION_KEY = 'wm_sessions_v1';
+    let activeSessionId = null;
+    let mode = 'topic';
+
+    function loadSessions(){
+      try{
+        const raw = localStorage.getItem(SESSION_KEY);
+        const xs = raw ? JSON.parse(raw) : [];
+        return Array.isArray(xs) ? xs : [];
+      }catch(_){ return []; }
+    }
+    function saveSessions(xs){
+      localStorage.setItem(SESSION_KEY, JSON.stringify(xs || []));
+    }
+
+    function upsertSession(patch){
+      const xs = loadSessions();
+      const i = xs.findIndex(s => s && s.session_id === patch.session_id);
+      if (i >= 0) xs[i] = { ...xs[i], ...patch, updated_at: nowTs() };
+      else xs.unshift({
+        session_id: patch.session_id,
+        created_at: patch.created_at || nowTs(),
+        updated_at: nowTs(),
+        status: patch.status || 'running',
+        kind: patch.kind,
+        query: patch.query,
+        job_id: patch.job_id || '',
+        result: patch.result || null,
+        artifacts: patch.artifacts || [],
+        last_stage: patch.last_stage || 'queued',
+        progress: patch.progress || null,
+        logs: patch.logs || [],
+      });
+      saveSessions(xs);
+      renderSessionList();
+    }
+
+    function appendArtifact(sessionId, art){
+      const xs = loadSessions();
+      const i = xs.findIndex(s => s && s.session_id === sessionId);
+      if (i < 0) return;
+      const arts = Array.isArray(xs[i].artifacts) ? xs[i].artifacts : [];
+      arts.push({ ts: nowTs(), ...art });
+      xs[i].artifacts = arts.slice(-80);
+      xs[i].updated_at = nowTs();
+      saveSessions(xs);
+    }
+    function appendLog(sessionId, line){
+      const xs = loadSessions();
+      const i = xs.findIndex(s => s && s.session_id === sessionId);
+      if (i < 0) return;
+      const logs = Array.isArray(xs[i].logs) ? xs[i].logs : [];
+      const msg = String(line || '').trim();
+      if (!msg) return;
+      if (logs.length && logs[logs.length-1] === msg) return;
+      logs.push(msg);
+      xs[i].logs = logs.slice(-120);
+      xs[i].updated_at = nowTs();
+      saveSessions(xs);
+    }
+
+    function setActiveSession(sessionId){
+      activeSessionId = sessionId;
+      renderSessionList();
+      renderSessionView(sessionId);
+    }
+    window.setActiveSession = setActiveSession;
+
+    function renderSessionList(){
+      const xs = loadSessions();
+      if (!xs.length){
+        sessionListEl.innerHTML = `<div class="muted" style="padding:10px;">暂无</div>`;
+        return;
+      }
+      sessionListEl.innerHTML = xs.slice(0, 40).map(s => {
+        const title = s.kind === 'topic' ? `主题：${s.query || ''}` : `人物：${s.query || ''}`;
+        const meta = `${fmtTime(s.created_at)} · ${s.status || ''}`;
+        const active = (s.session_id === activeSessionId) ? 'is-active' : '';
+        return `
+          <div class="wm-topic-item ${active}" onclick="window.setActiveSession('${esc(s.session_id)}')">
+            <button class="wm-delete-btn" title="删除会话" onclick="window.deleteSession('${esc(s.session_id)}', event)">×</button>
+            <div class="wm-topic-title">${esc(title)}</div>
+            <div class="wm-topic-meta">${esc(meta)}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    window.deleteSession = (sid, e) => {
+      if (e) e.stopPropagation();
+      if (!confirm('确定要删除这个会话记录吗？（仅删除本地）')) return;
+      let xs = loadSessions();
+      xs = xs.filter(x => x && x.session_id !== sid);
+      saveSessions(xs);
+      if (activeSessionId === sid){
+        activeSessionId = null;
+        renderSessionView(null);
+      }
+      renderSessionList();
+    };
+
+    function setMode(next, opts){
+      const silent = !!(opts && opts.silent);
+      mode = next;
+      modeTopicBtn.classList.toggle('is-active', mode==='topic');
+      modePersonBtn.classList.toggle('is-active', mode==='person');
+      if (wmModeHint) wmModeHint.textContent = (mode==='topic')
+        ? '主题流水线：输入一段调研需求'
+        : '人物深搜：输入一个人名';
+      if (mode==='topic') qInput.placeholder = '输入调研需求（纯文字）：建议包含主题/定义、时间范围、排除项、子方向。';
+      else qInput.placeholder = '输入人物姓名：例如 周志华 / Fei-Fei Li';
+      if (!silent) pushBot(`已切换到 ${mode==='topic' ? '主题搜索' : '人物深搜'} 模式。`);
+    }
+
+    modeTopicBtn.addEventListener('click', () => setMode('topic'));
+    modePersonBtn.addEventListener('click', () => setMode('person'));
+
+    // ----------------------------
+    // Minimal workspace message helpers
+    // ----------------------------
+    function pushBot(text){
+      const el = document.createElement('div');
+      el.className = 'wm-msg bot';
+      el.innerHTML = `<div class="wm-bubble">${esc(text)}</div>`;
+      workspace.appendChild(el);
+      workspace.scrollTop = workspace.scrollHeight;
+    }
+
+    // ----------------------------
+    // Render Session View (dashboard-ish)
+    // ----------------------------
+    function renderStickyHeader(session){
+      if (!session) return '';
+      const kind = session.kind;
+      const status = session.status || '';
+      const st = session.last_stage || '';
+      let deepPct = 0, profPct = 0, deepMeta = '', profMeta = '';
+      if (kind === 'topic' && session.progress){
+        const d = session.progress.deepresearch || {done:0,total:0};
+        const p = session.progress.profile || {done:0,total:0};
+        deepPct = d.total ? Math.round(100*d.done/d.total) : 0;
+        profPct = p.total ? Math.round(100*p.done/p.total) : 0;
+        deepMeta = `${d.done}/${d.total}`;
+        profMeta = `${p.done}/${p.total}`;
+      }
+      return `
+        <div class="wm-sticky-header">
+          <div class="wm-header-row">
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+              <span class="chip">${esc(kind)}</span>
+              <span style="font-weight:900;">${esc(session.query || '')}</span>
+              <span class="muted mono" style="font-size:0.85rem;">${esc(session.job_id || '')}</span>
+            </div>
+            <div class="muted mono" style="font-size:0.85rem;">${esc(status)} · ${esc(st)}</div>
+          </div>
+
+          ${kind === 'topic' ? `
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+            <div>
+              <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--muted);">
+                <span>DeepResearch</span><span class="mono">${esc(deepMeta)}</span>
+              </div>
+              <div class="wm-mini-progress"><div class="wm-mini-fill" style="width:${deepPct}%"></div></div>
+            </div>
+            <div>
+              <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:var(--muted);">
+                <span>Profile</span><span class="mono">${esc(profMeta)}</span>
+              </div>
+              <div class="wm-mini-progress"><div class="wm-mini-fill" style="width:${profPct}%"></div></div>
+            </div>
+          </div>` : ''}
+        </div>
+      `;
+    }
+
+    function renderTimeline(session){
+      const arts = Array.isArray(session.artifacts) ? session.artifacts : [];
+      let html = `<div class="wm-timeline">`;
+
+      for (let i=0; i<arts.length; i++){
+        const a = arts[i] || {};
+        const when = a.ts ? fmtTime(a.ts) : '';
+
+        if (a.kind === 'plan'){
+          const p = a.plan || {};
+          html += `
+            <div class="wm-card">
+              <div class="wm-card-header">📋 Plan <span class="muted" style="margin-left:auto;">${esc(when)}</span></div>
+              <div class="wm-card-body">
+                <div style="margin-bottom:10px;">
+                  ${(p.keywords||[]).map(k => `<span class="wm-tag">${esc(k)}</span>`).join('')}
+                </div>
+                ${p.definition ? `<div class="wm-quote-box">${esc(p.definition)}</div>` : `<div class="muted">definition：未提供或不清晰</div>`}
+              </div>
+            </div>
+          `;
+        }
+
+        if (a.kind === 'candidates'){
+          const preview = (a.items_preview||[]).slice(0,5).map(x=>x.name).filter(Boolean).join(', ');
+          html += `
+            <div class="wm-card">
+              <div class="wm-card-header">👥 Candidates <span class="muted" style="margin-left:auto;">${esc(when)}</span></div>
+              <div class="wm-card-body">
+                <div class="muted">total_candidates: <span class="mono">${esc(a.total_candidates ?? '')}</span></div>
+                <div class="muted" style="margin-top:6px;">Top5: <span style="color:var(--text);">${esc(preview)}...</span></div>
+                <div style="margin-top:12px;">
+                  <button class="btn" type="button" style="width:100%;" onclick="window.__viewCandidates('${esc(session.session_id)}', ${i})">
+                    查看候选人（当前 artifact 预览：${(a.items_preview||[]).length}）
+                  </button>
+                  <div class="muted" style="margin-top:6px; font-size:0.85rem;">
+                    说明：OpenAlex 完整几百人结果目前不通过 SSE 下发（太大）。任务完成后建议跳转 index.html 查看完整 profile 大表。
+                  </div>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+
+        if (a.kind === 'result'){
+          const topicId = a.topic_id || (session.result && session.result.topic_id);
+          const topicQuery = session.query || '';
+          const url = `index.html?q=${encodeURIComponent(topicQuery)}&sort=S_prime_desc`;
+
+          html += `
+            <div class="wm-card" style="border-color:var(--accent);">
+              <div class="wm-card-header" style="color:var(--accent);">🏁 Result <span class="muted" style="margin-left:auto;">${esc(when)}</span></div>
+              <div class="wm-card-body" style="display:flex; gap:10px; flex-wrap:wrap;">
+                <a class="btn" href="${esc(url)}" target="_blank" style="text-decoration:none;">
+                  打开完整榜单（index.html · profile大表）
+                </a>
+                ${topicId ? `
+                  <button class="btn" type="button" onclick="window.__openTopic('${esc(topicId)}')">
+                    查看该主题榜单（topic.json）
+                  </button>
+                ` : ''}
+              </div>
+            </div>
+          `;
+        }
+      }
+
+      // processing line
+      if (session.status === 'running'){
+        const lastLog = (session.logs && session.logs.length) ? session.logs[session.logs.length-1] : 'Processing...';
+        html += `
+          <div class="wm-processing-stream">
+            <div class="wm-processing-icon">⚡</div>
+            <div class="wm-stream-text">${esc(lastLog)}</div>
+          </div>
+        `;
+      }
+
+      html += `</div>`;
+      return html;
+    }
+
+    function renderSessionView(sessionId){
+      workspace.innerHTML = '';
+      if (!sessionId){
+        pushBot('欢迎使用搜索调查页。请在左侧选择会话或在下方发起任务。');
+        runningOverlay.style.display = 'none';
+        return;
+      }
+      const xs = loadSessions();
+      const s = xs.find(x => x && x.session_id === sessionId);
+      if (!s){
+        pushBot('Session 不存在。');
+        runningOverlay.style.display = 'none';
+        return;
+      }
+
+      workspace.innerHTML = renderStickyHeader(s) + renderTimeline(s);
+
+      if (s.status === 'running'){
+        runningOverlay.style.display = 'flex';
+        btnCancel.onclick = () => window.__cancelJob();
+        const hasCand = (s.artifacts||[]).some(a => a && a.kind === 'candidates');
+        if (s.kind === 'topic' && hasCand){
+          btnFastProfile.style.display = 'block';
+          btnFastProfile.onclick = () => window.__fastProfileActiveJob();
+        } else {
+          btnFastProfile.style.display = 'none';
+          btnFastProfile.onclick = null;
+        }
+      } else {
+        runningOverlay.style.display = 'none';
+        btnFastProfile.onclick = null;
+        btnCancel.onclick = null;
+      }
+    }
+
+    // ----------------------------
+    // Candidates modal: show preview list
+    // ----------------------------
+    function renderCandidatesTable(items){
+      const rows = (items||[]).map((it, i) => {
+        const score = (typeof it.score === 'number') ? it.score.toFixed(1) : (it.score ?? '-');
+        const openalex = it.openalex_id ? `<a class="link" href="${esc(it.openalex_id)}" target="_blank">OpenAlex</a>` : '';
+        const kws = (it.keywords_hit||[]).slice(0,6).map(k => `<span class="chip">#${esc(k)}</span>`).join(' ');
+        return `
+          <tr>
+            <td class="mono">${i+1}</td>
+            <td>
+              <div style="font-weight:900;">${esc(it.name || '')}</div>
+              <div class="muted" style="margin-top:4px;">${kws}</div>
+            </td>
+            <td class="mono">${esc(score)}</td>
+            <td class="mono hide-sm">${esc(it.related_works ?? '-')}</td>
+            <td class="mono hide-sm">${esc(it.related_citations_sum ?? '-')}</td>
+            <td class="mono hide-sm">${esc(it.related_recent_3y ?? '-')}</td>
+            <td style="text-align:right;">${openalex}</td>
+          </tr>
+        `;
+      }).join('');
+
+      listBody.innerHTML = `
+        <table class="table">
+          <thead>
+            <tr>
+              <th style="width:60px;">#</th>
+              <th>研究者</th>
+              <th style="width:90px;">score</th>
+              <th class="hide-sm" style="width:90px;">works</th>
+              <th class="hide-sm" style="width:110px;">citations</th>
+              <th class="hide-sm" style="width:90px;">recent3y</th>
+              <th style="width:90px; text-align:right;">links</th>
+            </tr>
+          </thead>
+          <tbody>${rows || `<tr><td colspan="7"><div class="muted" style="padding:16px;">无结果</div></td></tr>`}</tbody>
+        </table>
+      `;
+    }
+
+    window.__viewCandidates = (sid, artIdx) => {
+      const xs = loadSessions();
+      const s = xs.find(x => x && x.session_id === sid);
+      if (!s) return;
+      const art = (s.artifacts||[])[artIdx];
+      if (!art || art.kind !== 'candidates') return;
+
+      const all = art.items_preview || [];
+      listTitle.textContent = `候选人预览（${all.length}）`;
+      listSearch.value = '';
+      renderCandidatesTable(all);
+
+      listSearch.oninput = () => {
+        const q = (listSearch.value || '').trim().toLowerCase();
+        if (!q){ renderCandidatesTable(all); return; }
+        const filtered = all.filter(it => {
+          const name = String(it.name||'').toLowerCase();
+          const kws = (it.keywords_hit||[]).join(' ').toLowerCase();
+          return name.includes(q) || kws.includes(q);
+        });
+        renderCandidatesTable(filtered);
+      };
+
+      listModal.classList.add('is-open');
+      listModal.setAttribute('aria-hidden', 'false');
+    };
+
+    // ----------------------------
+    // Need input modal
+    // ----------------------------
+    function openModal({ title, desc, placeholder }){
+      const bd = document.getElementById('wmModal');
+      const t = document.getElementById('wmModalTitle');
+      const d = document.getElementById('wmModalDesc');
+      const inp = document.getElementById('wmModalInput');
+      const ok = document.getElementById('wmModalOk');
+      const cancel = document.getElementById('wmModalCancel');
+
+      t.textContent = title || '需要补充信息';
+      d.textContent = desc || '';
+      inp.value = '';
+      inp.placeholder = placeholder || '请补充说明...';
+
+      bd.classList.add('is-open');
+      bd.setAttribute('aria-hidden', 'false');
+      window.setTimeout(() => inp.focus(), 0);
+
+      return new Promise((resolve) => {
+        function close(ret){
+          bd.classList.remove('is-open');
+          bd.setAttribute('aria-hidden', 'true');
+          ok.removeEventListener('click', onOk);
+          cancel.removeEventListener('click', onCancel);
+          bd.removeEventListener('click', onBackdrop);
+          document.removeEventListener('keydown', onKey);
+          resolve(ret);
+        }
+        function onOk(){ close({ ok:true, text: (inp.value||'').trim() }); }
+        function onCancel(){ close({ ok:false, text:'' }); }
+        function onBackdrop(e){ if (e.target === bd) onCancel(); }
+        function onKey(e){ if (e.key === 'Escape') onCancel(); }
+        ok.addEventListener('click', onOk);
+        cancel.addEventListener('click', onCancel);
+        bd.addEventListener('click', onBackdrop);
+        document.addEventListener('keydown', onKey);
+      });
+    }
+
+    // ----------------------------
+    // API calls
+    // ----------------------------
+    async function submitJob(kind, query, apiKey, deep){
+      const url = (kind==='topic') ? '/api/jobs/topic' : '/api/jobs/investigate';
+      const body = (kind==='topic')
+        ? { topic: query, api_key: apiKey, deepsearch: deep }
+        : { name: query, api_key: apiKey, deepsearch: deep };
+      const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`提交失败: ${res.status}`);
+      return await res.json();
+    }
+
+    async function continueJob(jobId, apiKey, text){
+      const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/continue`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ api_key: apiKey, text })
+      });
+      if (!res.ok) throw new Error(`继续失败: ${res.status}`);
+      return await res.json();
+    }
+
+    async function fastProfile(jobId){
+      const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/fast_profile`, { method:'POST' });
+      if (!res.ok) throw new Error(`请求失败: ${res.status}`);
+      return await res.json();
+    }
+
+    async function cancelJob(jobId){
+      const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method:'POST' });
+      if (!res.ok) throw new Error(`取消失败: ${res.status}`);
+      return await res.json();
+    }
+
+    // ----------------------------
+    // SSE watcher
+    // ----------------------------
+    async function watchJob(jobId, kind, query){
+      const sessionId = activeSessionId;
+      const es = new EventSource(`/api/jobs/${jobId}/events`);
+      let prog = { deepresearch: {done:0,total:0}, profile: {done:0,total:0} };
+
+      function syncSession(patch){
+        upsertSession({ session_id: sessionId, ...patch });
+        if (activeSessionId === sessionId) renderSessionView(sessionId);
+      }
+
+      es.addEventListener('stage', (e) => {
+        const d = JSON.parse(e.data);
+        syncSession({ last_stage: d.stage || 'queued' });
+      });
+      es.addEventListener('log', (e) => {
+        const d = JSON.parse(e.data);
+        if (d.message) appendLog(sessionId, d.message);
+        if (activeSessionId === sessionId) renderSessionView(sessionId);
+      });
+      es.addEventListener('artifact', (e) => {
+        const d = JSON.parse(e.data);
+        appendArtifact(sessionId, d);
+        if (activeSessionId === sessionId) renderSessionView(sessionId);
+      });
+      es.addEventListener('progress', (e) => {
+        const d = JSON.parse(e.data);
+        if (d.phase === 'deepresearch') prog.deepresearch = { done: d.done||0, total: d.total||0 };
+        if (d.phase === 'profile') prog.profile = { done: d.done||0, total: d.total||0 };
+        syncSession({ progress: { ...prog } });
+      });
+
+      es.addEventListener('need_input', async (e) => {
+        const d = JSON.parse(e.data);
+        es.close();
+        syncSession({ status:'waiting_user', last_stage:'need_input' });
+        const qs = (d.questions || []).map(x => `- ${x}`).join('\n');
+        const apiKey = getApiKey() || apiKeyInput.value.trim();
+        const modal = await openModal({
+          title: '需要补充信息才能继续',
+          desc: `请补充 1-3 句定义/范围说明：\n\n${qs}`,
+          placeholder: '例如：我这里的“世界模型”指...，包含...，不包含...'
+        });
+        const text = modal.ok && modal.text ? modal.text : '（定义仍不清晰，按默认理解继续执行）';
+        await continueJob(jobId, apiKey, text);
+        syncSession({ status:'running', last_stage:'queued' });
+        await watchJob(jobId, kind, query + "\n\n" + text);
+      });
+
+      es.addEventListener('done', async (e) => {
+        const d = JSON.parse(e.data);
+        es.close();
+
+        if (kind === 'topic'){
+          const tid = d.topic_id;
+          upsertSession({
+            session_id: sessionId,
+            status: 'done',
+            last_stage: 'done',
+            result: { topic_id: tid, topic: d.topic || query }
+          });
+          appendArtifact(sessionId, { kind:'result', topic_id: tid, topic: d.topic || query });
+          await loadTopicList();
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+        } else {
+          upsertSession({
+            session_id: sessionId,
+            status: 'done',
+            last_stage: 'done',
+            result: { name: query }
+          });
+          appendArtifact(sessionId, { kind:'result', name: query });
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+        }
+      });
+
+      es.addEventListener('error', (e) => {
+        try { const d = JSON.parse(e.data); pushBot(`错误：${d.message||''}`); }
+        catch (_) { pushBot('错误'); }
+      });
+      es.addEventListener('eof', () => es.close());
+    }
+
+    // ----------------------------
+    // Controls
+    // ----------------------------
+    window.__fastProfileActiveJob = async () => {
+      try{
+        const sid = activeSessionId;
+        if (!sid) return;
+        const s = loadSessions().find(x => x && x.session_id === sid);
+        if (!s || !s.job_id) return;
+        appendLog(sid, '请求：停止继续 DeepResearch，直接进入 Profile 生成...');
+        await fastProfile(s.job_id);
+        appendLog(sid, '请求已发送。');
+        if (activeSessionId === sid) renderSessionView(sid);
+      }catch(e){
+        pushBot(`fast_profile 失败：${e.message}`);
+      }
+    };
+
+    window.__cancelJob = async () => {
+      try{
+        const sid = activeSessionId;
+        if (!sid) return;
+        const s = loadSessions().find(x => x && x.session_id === sid);
+        if (!s || !s.job_id) return;
+        appendLog(sid, '请求取消...');
+        await cancelJob(s.job_id);
+        appendLog(sid, '取消请求已发送。');
+        if (activeSessionId === sid) renderSessionView(sid);
+      }catch(e){
+        pushBot(`取消失败：${e.message}`);
+      }
+    };
+
+    // ----------------------------
+    // Topic history
+    // ----------------------------
+    async function loadTopicList(){
+      try{
+        const res = await fetch('/api/topics');
+        const data = await res.json();
+        const items = data.items || [];
+        if (!items.length){
+          topicListEl.innerHTML = `<div class="muted" style="padding:10px;">暂无历史</div>`;
+          return;
+        }
+        topicListEl.innerHTML = items.map(it => {
+          const t = it.topic || '(no topic)';
+          const when = it.created_at ? new Date(it.created_at * 1000).toLocaleString() : '';
+          return `
+            <button class="wm-topic-item" type="button" onclick="window.__openTopic('${esc(it.id)}')">
+              <div class="wm-topic-title">${esc(t)}</div>
+              <div class="wm-topic-meta">${esc(when)} · ${esc(it.item_count)} 人</div>
+            </button>
+          `;
+        }).join('');
+      }catch(e){
+        topicListEl.innerHTML = `<div class="error" style="padding:10px;">加载失败：${esc(e.message)}</div>`;
+      }
+    }
+
+    window.__openTopic = async (id) => {
+      try{
+        const res = await fetch(`/api/topics/${encodeURIComponent(id)}`);
+        if (!res.ok) throw new Error(`API 错误: ${res.status}`);
+        const data = await res.json();
+        setMode('topic', { silent: true });
+
+        const sessionId = `topic-result-${String(id)}`;
+        upsertSession({
+          session_id: sessionId,
+          status: 'done',
+          kind: 'topic',
+          query: data.topic || id,
+          job_id: '',
+          last_stage: 'done',
+          result: { topic_id: id, topic: data.topic || id },
+          artifacts: [
+            { kind:'plan', plan: data.plan || {}, ts: nowTs() },
+            { kind:'candidates', total_candidates: data.total_candidates, items_preview: (data.items||[]).slice(0, 50), ts: nowTs() },
+            { kind:'result', topic_id: id, topic: data.topic || id, ts: nowTs() },
+          ],
+          progress: null,
+          logs: [],
+        });
+        setActiveSession(sessionId);
+      }catch(e){
+        pushBot(`打开失败：${e.message}`);
+      }
+    };
+
+    // ----------------------------
+    // Send
+    // ----------------------------
+    async function send(){
+      const query = (qInput.value || '').trim();
+      if (!query) return;
+
+      const apiKey = getApiKey() || apiKeyInput.value.trim();
+      if (!apiKey){ pushBot('请先输入 API Key。'); return; }
+      setApiKey(apiKey);
+
+      const deep = !!deepCb.checked;
+
+      const kind = (mode==='topic') ? 'topic' : 'person';
+      const sessionId = Math.random().toString(16).slice(2) + '-' + Date.now().toString(16);
+      upsertSession({ session_id: sessionId, status:'running', kind, query, last_stage:'queued', progress:null, result:null, artifacts:[], logs:[] });
+      setActiveSession(sessionId);
+      pushBot(`正在发起 ${kind==='topic' ? '主题搜索' : '人物深搜'}...`);
+
+      const { job_id } = await submitJob(kind, query, apiKey, deep);
+      upsertSession({ session_id: sessionId, job_id });
+      await watchJob(job_id, kind, query);
+
+      if (mode !== 'topic') qInput.value = '';
+    }
+
+    sendBtn.addEventListener('click', () => send().catch(e => pushBot(`失败：${e.message}`)));
+    qInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        send().catch(err => pushBot(`失败：${err.message}`));
+      }
+    });
+
+    // init
+    setMode('topic', { silent: true });
+    loadTopicList();
+    renderSessionList();
+    const xs = loadSessions();
+    if (xs.length) setActiveSession(xs[0].session_id);
+    else renderSessionView(null);
+  </script>
+</body>
+</html>

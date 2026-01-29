@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>研究者详情</title>
+  <link rel="stylesheet" href="theme.css">
+</head>
+<body>
+  <div class="container narrow">
+    <div class="topbar">
+      <a class="back" href="index.html">← 返回榜单</a>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <span id="meta" class="badge">加载中...</span>
+        <button id="themeBtn" class="btn">切换主题</button>
+      </div>
+    </div>
+
+    <div id="app" class="panel">
+      <div class="loading">加载中...</div>
+    </div>
+  </div>
+
+  <script>
+    // theme
+    const root = document.documentElement;
+    const themeBtn = document.getElementById('themeBtn');
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light' || saved === 'dark') root.setAttribute('data-theme', saved);
+    else root.setAttribute('data-theme', 'light');
+    themeBtn.addEventListener('click', () => {
+      const cur = root.getAttribute('data-theme') || 'light';
+      const next = cur === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+    });
+
+    const app = document.getElementById('app');
+    const meta = document.getElementById('meta');
+    const params = new URLSearchParams(location.search);
+    const name = params.get('name');
+
+    if (!name) {
+      app.innerHTML = '<div class="error">缺少参数：name</div>';
+      meta.textContent = 'error';
+    } else {
+      loadDetail(name);
+    }
+
+    async function loadDetail(name) {
+      try {
+        const res = await fetch(`/api/people/${encodeURIComponent(name)}`);
+        if (!res.ok) throw new Error(`API 错误: ${res.status}`);
+        const data = await res.json();
+        meta.textContent = `api/people/${name}`;
+        render(data);
+      } catch (err) {
+        app.innerHTML = `<div class="error">加载失败：${err.message}</div>`;
+        meta.textContent = 'error';
+      }
+    }
+
+    function render(person) {
+      const p = person || {};
+      const prof = p.profile || {};
+      const score = p.score || {};
+
+      const titleLine = [
+        prof.affiliation_current || null,
+        prof.position_title || null,
+        prof.location || null
+      ].filter(Boolean).join(' · ') || '（单位/职位信息缺失）';
+
+      const directions = (prof.research_keywords && prof.research_keywords.length)
+        ? prof.research_keywords.slice(0, 12).join(' / ')
+        : (score.primary_directions || null);
+
+      const S = num(score.S);
+      const Sp = num(score.S_prime);
+      const comp = (typeof score.completeness === 'number') ? score.completeness : null;
+
+      const dims = score.dimensions || {};
+      const dimExplain = score.dimension_explanations || {};
+
+      const evidence = Array.isArray(score.evidence) ? score.evidence : [];
+      const missing = Array.isArray(score.missing_or_uncertain) ? score.missing_or_uncertain : [];
+
+      const repWorks = Array.isArray(prof.representative_works) ? prof.representative_works : [];
+      const links = Array.isArray(prof.evidence_links) ? prof.evidence_links : [];
+      const wmRel = prof.world_model_relevance || null;
+
+      const ids = [
+        ["主页", prof.homepage],
+        ["Google Scholar", prof.google_scholar],
+        ["Semantic Scholar", prof.semantic_scholar],
+        ["OpenAlex", prof.openalex],
+        ["ORCID", prof.orcid && (prof.orcid.startsWith("http") ? prof.orcid : `https://orcid.org/${prof.orcid}`)],
+        ["DBLP", prof.dblp],
+        ["GitHub", prof.github]
+      ].filter(x => !!x[1]);
+
+      app.innerHTML = `
+        <div>
+          <h1 class="left">${escapeHtml(p.name || '未知')}</h1>
+          <div class="subtitle">${escapeHtml(titleLine)}${directions ? `<div class="muted" style="margin-top:6px;">方向：${escapeHtml(directions)}</div>` : ''}</div>
+          ${renderChips([
+            wmRel?.is_core ? `世界模型核心：${wmRel.is_core}` : null,
+            ...(wmRel?.subareas || []).slice(0, 6).map(x => `子方向：${x}`)
+          ])}
+        </div>
+
+        <div class="row two">
+          <div class="section">
+            <div class="section-title">
+              <h2>影响力评分</h2>
+              <span class="badge">严格基于材料 · 缺失降权</span>
+            </div>
+
+            <div class="score-cards">
+              <div class="score-card">
+                <div class="label">总分 S</div>
+                <div class="value mono">${fmt(S, 2, '-')}</div>
+                <div class="hint">S = 0.35·impact + 0.25·field + 0.20·quality + 0.10·community + 0.10·momentum</div>
+              </div>
+              <div class="score-card">
+                <div class="label">惩罚后 S'</div>
+                <div class="value mono">${fmt(Sp, 2, '-')}</div>
+                <div class="hint">S' = S × (0.7 + 0.3·completeness)</div>
+              </div>
+              <div class="score-card">
+                <div class="label">完备度 completeness</div>
+                <div class="value mono">${comp !== null ? Math.round(comp * 100) + '%' : '-'}</div>
+                <div class="hint">完备度越低，对总分惩罚越大</div>
+              </div>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="section-title" style="margin-bottom:8px;">
+              <h2>五维度分解</h2>
+              <span class="summary-hint">条形图 + 简要解释</span>
+            </div>
+
+            ${renderDimensionBars(dims)}
+            ${renderDimensionExplain(dimExplain)}
+          </div>
+
+          <div class="section">
+            <div class="section-title">
+              <h2>一句话结论</h2>
+              <span class="badge">评分摘要</span>
+            </div>
+            <div class="md">
+              ${renderMdParagraph(score.one_line_conclusion || '（缺失）')}
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="section-title">
+              <h2>缺失/不确定项</h2>
+              <span class="summary-hint">${missing.length} 项</span>
+            </div>
+            ${missing.length ? renderBulletList(missing) : `<div class="muted">无</div>`}
+          </div>
+        </div>
+
+        <div class="row">
+          <details open>
+            <summary>
+              <span>研究者资料（结构化渲染）</span>
+              <span class="summary-hint">身份 / 指标 / 链接 / 代表作</span>
+            </summary>
+            <div class="detail-body">
+              ${renderProfileSection(prof, ids, links, repWorks)}
+            </div>
+          </details>
+
+          <details>
+            <summary>
+              <span>评分证据清单</span>
+              <span class="summary-hint">${evidence.length} 条</span>
+            </summary>
+            <div class="detail-body">
+              ${evidence.length ? renderEvidence(evidence) : `<div class="muted">无</div>`}
+            </div>
+          </details>
+
+          <details>
+            <summary>
+              <span>评分说明（结构化渲染）</span>
+              <span class="summary-hint">五维解释 + 公式回顾</span>
+            </summary>
+            <div class="detail-body md">
+              ${renderScoreNarrative(score)}
+            </div>
+          </details>
+        </div>
+      `;
+    }
+
+    function renderDimensionBars(dims) {
+      const rows = [
+        ["impact", "全局影响力", num(dims.impact)],
+        ["field", "领域内影响", num(dims.field)],
+        ["quality", "质量与声望", num(dims.quality)],
+        ["community", "共同体影响", num(dims.community)],
+        ["momentum", "近期趋势", num(dims.momentum)],
+      ];
+      return `<div class="bars">${
+        rows.map(([key, label, v]) => {
+          const val = (v === null) ? 0 : clamp(v, 0, 100);
+          return `
+            <div class="bar-row">
+              <div class="bar-name">${label}</div>
+              <div class="bar-track"><div class="bar-fill" style="width:${val}%;"></div></div>
+              <div class="bar-val mono">${v === null ? '-' : v.toFixed(1)}</div>
+            </div>
+          `;
+        }).join('')
+      }</div>`;
+    }
+
+    function renderDimensionExplain(expl) {
+      const items = [
+        ["impact", "全局影响力", expl.impact],
+        ["field", "领域内影响", expl.field],
+        ["quality", "质量与声望", expl.quality],
+        ["community", "共同体影响", expl.community],
+        ["momentum", "近期趋势", expl.momentum],
+      ].map(([k, label, txt]) => `
+        <div class="kv">
+          <div class="k">${label}</div>
+          <div class="v md">${renderMdInline(txt || '（缺失）')}</div>
+        </div>
+      `).join('');
+      return `<div style="margin-top:12px;">${items}</div>`;
+    }
+
+    function renderProfileSection(prof, ids, links, repWorks) {
+      const aliases = Array.isArray(prof.aliases) && prof.aliases.length ? prof.aliases.join(' / ') : null;
+
+      const metrics = prof.metrics || {};
+      const metricLines = [
+        ["总引用", metrics.citations],
+        ["h-index", metrics.h_index],
+        ["近3年引用增量", metrics.citations_last_3y],
+        ["近5年引用增量", metrics.citations_last_5y],
+      ].map(([k, v]) => `<div class="kv"><div class="k">${k}</div><div class="v mono">${v ?? '—'}</div></div>`).join('');
+
+      const kw = Array.isArray(prof.research_keywords) ? prof.research_keywords : [];
+      const kwChips = kw.length ? renderChips(kw.slice(0, 20)) : `<div class="muted">（缺失）</div>`;
+
+      const roles = Array.isArray(prof.community_roles) ? prof.community_roles : [];
+      const rolesHtml = roles.length ? roles.map(r => {
+        const t = [r.role, r.venue_or_org, r.year].filter(Boolean).join(" · ");
+        return `<div class="item"><div class="item-title">${escapeHtml(t)}</div><div class="muted">${escapeHtml(r.source || '')}</div></div>`;
+      }).join('') : `<div class="muted">（缺失）</div>`;
+
+      const worksHtml = repWorks.length ? repWorks.slice(0, 12).map(w => {
+        const head = [
+          w.title || '（无标题）',
+          w.venue ? `| ${w.venue}` : null,
+          w.year ? `| ${w.year}` : null,
+          w.type ? `| ${w.type}` : null
+        ].filter(Boolean).join(' ');
+        const links = Array.isArray(w.links) ? w.links : [];
+        return `
+          <div class="item">
+            <div class="item-title">${escapeHtml(head)}</div>
+            ${w.authors ? `<div class="muted">作者：${escapeHtml(w.authors)}</div>` : ''}
+            ${w.role ? `<div class="muted">作者位次/角色：${escapeHtml(w.role)}</div>` : ''}
+            ${w.notes ? `<div class="md">${renderMdParagraph(w.notes)}</div>` : ''}
+            ${links.length ? `<div class="chips">${links.slice(0, 6).map(u => `<span class="chip"><a href="${escapeAttr(u)}" target="_blank">链接</a></span>`).join('')}</div>` : ''}
+          </div>
+        `;
+      }).join('') : `<div class="muted">（缺失）</div>`;
+
+      const linksHtml = links.length ? links.slice(0, 20).map(l => {
+        const u = l.url || '';
+        const label = l.label || 'link';
+        return `<span class="chip"><a href="${escapeAttr(u)}" target="_blank">${escapeHtml(label)}</a></span>`;
+      }).join('') : '';
+
+      const idsHtml = ids.length ? ids.map(([label, url]) => {
+        return `<div class="kv"><div class="k">${escapeHtml(label)}</div><div class="v">${renderLink(url)}</div></div>`;
+      }).join('') : `<div class="muted">（缺失）</div>`;
+
+      return `
+        <div class="section" style="margin-bottom:12px;">
+          <div class="section-title"><h2>基本信息</h2><span class="summary-hint">来自 profile</span></div>
+          ${renderKV("姓名", prof.name)}
+          ${renderKV("别名", aliases)}
+          ${renderKV("现任单位", prof.affiliation_current)}
+          ${renderKV("职位", prof.position_title)}
+          ${renderKV("地区", prof.location)}
+          ${renderKV("公开邮箱", prof.email_public)}
+        </div>
+
+        <div class="section" style="margin-bottom:12px;">
+          <div class="section-title"><h2>身份ID / 主页</h2><span class="summary-hint">可点击</span></div>
+          ${idsHtml}
+        </div>
+
+        <div class="section" style="margin-bottom:12px;">
+          <div class="section-title"><h2>研究关键词</h2><span class="summary-hint">${kw.length} 个</span></div>
+          ${kwChips}
+        </div>
+
+        <div class="section" style="margin-bottom:12px;">
+          <div class="section-title"><h2>影响力指标（材料中可核验）</h2><span class="summary-hint">缺失则为 —</span></div>
+          ${metricLines}
+        </div>
+
+        <div class="section" style="margin-bottom:12px;">
+          <div class="section-title"><h2>代表性成果（最多展示 12）</h2><span class="summary-hint">${repWorks.length} 条</span></div>
+          <div class="list">${worksHtml}</div>
+        </div>
+
+        <div class="section" style="margin-bottom:12px;">
+          <div class="section-title"><h2>共同体角色</h2><span class="summary-hint">${roles.length} 条</span></div>
+          <div class="list">${rolesHtml}</div>
+        </div>
+
+        ${linksHtml ? `
+        <div class="section">
+          <div class="section-title"><h2>证据链接（最多 20）</h2><span class="summary-hint">用于审计</span></div>
+          <div class="chips">${linksHtml}</div>
+        </div>` : ''}
+      `;
+    }
+
+    function renderEvidence(evidence) {
+      const items = evidence.slice(0, 12).map(e => {
+        const type = e.type || 'evidence';
+        const fact = e.fact || '';
+        const src = e.source || '';
+        const srcHtml = src && looksLikeUrl(src) ? renderLink(src) : escapeHtml(src);
+        return `
+          <div class="evi">
+            <div class="evi-top">
+              <span class="evi-type">${escapeHtml(type)}</span>
+              <span class="evi-fact">${escapeHtml(fact)}</span>
+            </div>
+            <div class="evi-src">${srcHtml}</div>
+          </div>
+        `;
+      }).join('');
+      return `<div class="evidence-grid">${items}</div>`;
+    }
+
+    function renderScoreNarrative(score) {
+      const dims = score.dimensions || {};
+      const exp = score.dimension_explanations || {};
+      const lines = [];
+      lines.push(`<h3>评分框架</h3>`);
+      lines.push(`<ul>
+        <li><code>S</code> = 0.35·impact + 0.25·field + 0.20·quality + 0.10·community + 0.10·momentum</li>
+        <li><code>S'</code> = S × (0.7 + 0.3·completeness)</li>
+      </ul>`);
+      lines.push(`<h3>五维度解释（来自模型输出）</h3>`);
+      lines.push(`<ul>
+        <li><b>impact</b>（${fmt(num(dims.impact), 1, '—')}）：${escapeHtml(exp.impact || '（缺失）')}</li>
+        <li><b>field</b>（${fmt(num(dims.field), 1, '—')}）：${escapeHtml(exp.field || '（缺失）')}</li>
+        <li><b>quality</b>（${fmt(num(dims.quality), 1, '—')}）：${escapeHtml(exp.quality || '（缺失）')}</li>
+        <li><b>community</b>（${fmt(num(dims.community), 1, '—')}）：${escapeHtml(exp.community || '（缺失）')}</li>
+        <li><b>momentum</b>（${fmt(num(dims.momentum), 1, '—')}）：${escapeHtml(exp.momentum || '（缺失）')}</li>
+      </ul>`);
+      lines.push(`<h3>结论</h3>`);
+      lines.push(renderMdParagraph(score.one_line_conclusion || '（缺失）'));
+      return lines.join('');
+    }
+
+    function renderKV(k, v) {
+      const val = (v === null || v === undefined || v === '') ? '—' : escapeHtml(String(v));
+      return `<div class="kv"><div class="k">${escapeHtml(k)}</div><div class="v">${val}</div></div>`;
+    }
+    function renderLink(url) {
+      if (!url) return '—';
+      const u = String(url);
+      const text = u.length > 70 ? u.slice(0, 67) + '...' : u;
+      return `<a href="${escapeAttr(u)}" target="_blank" rel="noopener">${escapeHtml(text)}</a>`;
+    }
+    function renderChips(items) {
+      const xs = (items || []).filter(Boolean);
+      if (!xs.length) return '';
+      return `<div class="chips">${xs.slice(0, 10).map(x => `<span class="chip">${escapeHtml(String(x))}</span>`).join('')}</div>`;
+    }
+    function renderBulletList(items) {
+      return `<div class="md"><ul>${items.map(x => `<li>${escapeHtml(String(x))}</li>`).join('')}</ul></div>`;
+    }
+
+    // markdown-ish renderer
+    function renderMdParagraph(text) {
+      const html = renderMd(text);
+      return html || `<p class="muted">（缺失）</p>`;
+    }
+    function renderMdInline(text) {
+      if (!text) return `<span class="muted">（缺失）</span>`;
+      return renderMd(text);
+    }
+    function renderMd(text) {
+      if (!text) return '';
+      const s = String(text).replace(/\r\n/g, '\n');
+      const lines = s.split('\n');
+      let out = [];
+      let inList = false;
+      function closeList(){ if(inList){ out.push('</ul>'); inList=false; } }
+      for (let raw of lines) {
+        const line = raw.trim();
+        if (!line) { closeList(); continue; }
+        const h3 = line.match(/^###\s+(.*)/);
+        if (h3) { closeList(); out.push(`<h3>${escapeHtml(h3[1])}</h3>`); continue; }
+        const li = line.match(/^[-*]\s+(.*)/);
+        if (li) {
+          if (!inList) { out.push('<ul>'); inList = true; }
+          out.push(`<li>${linkify(escapeHtml(li[1]))}</li>`);
+          continue;
+        }
+        closeList();
+        out.push(`<p>${linkify(escapeHtml(line))}</p>`);
+      }
+      closeList();
+      return out.join('');
+    }
+    function linkify(htmlEscapedText) {
+      const urlRe = /(https?:\/\/[^\s)]+)|(\bwww\.[^\s)]+)/g;
+      return htmlEscapedText.replace(urlRe, (m) => {
+        const url = m.startsWith('http') ? m : `https://${m}`;
+        return `<a href="${escapeAttr(url)}" target="_blank" rel="noopener">${escapeHtml(m)}</a>`;
+      });
+    }
+
+    function looksLikeUrl(s){ return /^https?:\/\/\S+$/i.test(String(s || '')); }
+    function num(v){ return (typeof v === 'number' && isFinite(v)) ? v : null; }
+    function fmt(v, digits, fallback){ if (v === null) return fallback; return v.toFixed(digits); }
+    function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+    function escapeHtml(s) {
+      return String(s ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+    function escapeAttr(s){ return escapeHtml(s).replaceAll('"', '&quot;'); }
+  </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+
+# Local env/cache
+.venv/
+.ruff_cache/
+
+# Local data artifacts
+data/cache/
+data/scored/
+data/profiles/
+data/people/
+data/output/
+data/candidates/
+
+# Web outputs (generated)
+data/web/people/
+data/web/topics/
+
+# Legacy
+crawler_legacy/
+
+# Keep static web data if you want it versioned; otherwise ignore too.
+# Crawler/web/people/

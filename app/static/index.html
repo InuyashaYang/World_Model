@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>世界模型研究者榜单</title>
+  <link rel="stylesheet" href="theme.css">
+</head>
+<body>
+  <div class="container">
+    <div class="topbar">
+      <span class="badge">World Model Leaderboard</span>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <a class="btn" href="search.html" style="text-decoration:none; display:inline-block;">搜索调查</a>
+        <button id="themeBtn" class="btn">切换主题</button>
+      </div>
+    </div>
+
+    <h1>世界模型研究者影响力榜单</h1>
+
+     <div class="toolbar">
+       <div class="left">
+         <input id="q" class="input" placeholder="搜索姓名 / 单位 / 关键词（profile.research_keywords）" />
+         <select id="sort">
+           <option value="S_prime_desc">按 S' 从高到低</option>
+           <option value="S_desc">按 S 从高到低</option>
+           <option value="name_asc">按姓名 A→Z</option>
+         </select>
+       </div>
+       <div class="right">
+         <button id="investigateBtn" class="btn">发起调查</button>
+         <span id="count" class="badge">0 人</span>
+         <span class="badge">点击行查看详情</span>
+       </div>
+      </div>
+
+    <div id="app"><div class="loading">加载中...</div></div>
+  </div>
+
+  <div id="wmModal" class="wm-modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="wm-modal">
+      <h3 id="wmModalTitle">发起调查</h3>
+      <div class="wm-modal-body">
+        <div class="muted" style="margin:0 0 10px;">输入研究者姓名与 API Key（仅保存在浏览器会话）。</div>
+        <input id="wmName" class="input" placeholder="研究者姓名" />
+        <div style="height:10px;"></div>
+        <input id="wmApiKey" class="input" placeholder="API Key" />
+        <div style="height:10px;"></div>
+        <label class="wm-checkbox"><input id="wmDeep" type="checkbox" /> 启用 DeepSearch（更慢更贵）</label>
+      </div>
+      <div class="wm-modal-actions">
+        <button id="wmModalCancel" class="btn" type="button">取消</button>
+        <button id="wmModalOk" class="btn" type="button">开始</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // theme
+    const root = document.documentElement;
+    const themeBtn = document.getElementById('themeBtn');
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light' || saved === 'dark') root.setAttribute('data-theme', saved);
+    else root.setAttribute('data-theme', 'light');
+    themeBtn.addEventListener('click', () => {
+      const cur = root.getAttribute('data-theme') || 'light';
+      const next = cur === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+    });
+
+    // app
+    const app = document.getElementById('app');
+    const qInput = document.getElementById('q');
+    const sortSel = document.getElementById('sort');
+    const countBadge = document.getElementById('count');
+    const investigateBtn = document.getElementById('investigateBtn');
+
+    let allPeople = [];
+
+    function getApiKey() {
+      return sessionStorage.getItem('api_key') || '';
+    }
+    function setApiKey(k) {
+      if (!k) sessionStorage.removeItem('api_key');
+      else sessionStorage.setItem('api_key', k);
+    }
+
+    function openModal(){
+      const bd = document.getElementById('wmModal');
+      const nameEl = document.getElementById('wmName');
+      const apiEl = document.getElementById('wmApiKey');
+      const deepEl = document.getElementById('wmDeep');
+      const ok = document.getElementById('wmModalOk');
+      const cancel = document.getElementById('wmModalCancel');
+
+      apiEl.value = getApiKey();
+      nameEl.value = '';
+      deepEl.checked = false;
+      bd.classList.add('is-open');
+      bd.setAttribute('aria-hidden', 'false');
+      window.setTimeout(() => nameEl.focus(), 0);
+
+      return new Promise((resolve) => {
+        function close(ret){
+          bd.classList.remove('is-open');
+          bd.setAttribute('aria-hidden', 'true');
+          ok.removeEventListener('click', onOk);
+          cancel.removeEventListener('click', onCancel);
+          bd.removeEventListener('click', onBackdrop);
+          document.removeEventListener('keydown', onKey);
+          resolve(ret);
+        }
+        function onOk(){
+          close({
+            ok: true,
+            name: (nameEl.value||'').trim(),
+            apiKey: (apiEl.value||'').trim(),
+            deep: !!deepEl.checked,
+          });
+        }
+        function onCancel(){ close({ ok:false }); }
+        function onBackdrop(e){ if (e.target === bd) onCancel(); }
+        function onKey(e){ if (e.key === 'Escape') onCancel(); }
+        ok.addEventListener('click', onOk);
+        cancel.addEventListener('click', onCancel);
+        bd.addEventListener('click', onBackdrop);
+        document.addEventListener('keydown', onKey);
+      });
+    }
+
+    async function startInvestigateFlow() {
+      const modal = await openModal();
+      if (!modal.ok) return;
+
+      const name = modal.name;
+      const apiKey = modal.apiKey;
+      const deep = modal.deep;
+      if (!name) return;
+      if (!apiKey) return;
+      setApiKey(apiKey);
+
+      app.innerHTML = `<div class="loading">已提交任务，等待执行...\n\n姓名：${escapeHtml(name)}\n阶段：queued</div>`;
+
+      const res = await fetch('/api/jobs/investigate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, api_key: apiKey, deepsearch: deep })
+      });
+      if (!res.ok) throw new Error(`提交失败: ${res.status}`);
+      const { job_id } = await res.json();
+      await watchJob(job_id, name);
+    }
+
+    async function watchJob(jobId, name) {
+      const evUrl = `/api/jobs/${jobId}/events`;
+      const es = new EventSource(evUrl);
+      let lastStage = 'queued';
+      let logs = [];
+
+      function repaint() {
+        const text = [
+          `任务：${jobId}`,
+          `姓名：${name}`,
+          `阶段：${lastStage}`,
+          '',
+          ...logs.slice(-12)
+        ].join('\n');
+        app.innerHTML = `<div class="loading" style="white-space:pre-wrap;">${escapeHtml(text)}</div>`;
+      }
+
+      es.addEventListener('queued', (e) => {
+        logs.push('已进入队列');
+        repaint();
+      });
+      es.addEventListener('stage', (e) => {
+        const data = JSON.parse(e.data);
+        lastStage = data.stage || lastStage;
+        logs.push(`进入阶段: ${lastStage}`);
+        repaint();
+      });
+      es.addEventListener('log', (e) => {
+        const data = JSON.parse(e.data);
+        logs.push(data.message || 'log');
+        repaint();
+      });
+      es.addEventListener('error', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          logs.push(`错误: ${data.message || 'unknown'}`);
+        } catch (_) {
+          logs.push('错误: unknown');
+        }
+        repaint();
+      });
+      es.addEventListener('done', async (e) => {
+        logs.push('完成，正在刷新榜单...');
+        repaint();
+        es.close();
+        await loadPeople();
+      });
+      es.addEventListener('eof', async (e) => {
+        es.close();
+      });
+
+      es.onerror = () => {
+        logs.push('连接中断（可能任务已结束或网络问题）');
+        repaint();
+      };
+    }
+
+    async function loadPeople() {
+      try {
+        const params = new URLSearchParams();
+        const q = (qInput.value || '').trim();
+        if (q) params.set('q', q);
+        params.set('sort', sortSel.value);
+
+        const res = await fetch(`/api/people?${params.toString()}`);
+        if (!res.ok) throw new Error(`API 错误: ${res.status}`);
+        const data = await res.json();
+
+        allPeople = (data.items || []).map(p => normalizePerson(p));
+        render();
+      } catch (err) {
+        app.innerHTML = `<div class="error">加载失败：${err.message}</div>`;
+      }
+    }
+
+    function normalizePerson(p) {
+      const name = p?.name ?? '未知';
+      const score = p?.score ?? null;
+      const profile = p?.profile ?? null;
+
+      const S = typeof score?.S === 'number' ? score.S : null;
+      const S_prime = typeof score?.S_prime === 'number' ? score.S_prime : null;
+      const completeness = typeof score?.completeness === 'number' ? score.completeness : null;
+
+      const aff = profile?.affiliation_current ?? null;
+      const title = profile?.position_title ?? null;
+
+      const keywords = Array.isArray(profile?.research_keywords) ? profile.research_keywords : [];
+      const wm = profile?.world_model_relevance ?? null;
+      const isCore = wm?.is_core ?? null;
+
+      return { raw: p, name, score, profile, S, S_prime, completeness, aff, title, keywords, isCore };
+    }
+
+    function filterPeople(people) {
+      // Server already filters.
+      return people;
+    }
+
+    function sortPeople(people) {
+      // Server already sorts.
+      return people;
+    }
+
+    function render() {
+      let people = filterPeople(allPeople);
+      people = sortPeople(people);
+
+      countBadge.textContent = `${people.length} 人`;
+
+      const rows = people.map((p, idx) => {
+        const rank = idx + 1;
+        const rankClass = rank <= 3 ? 'top3' : '';
+        const S = p.S !== null ? p.S.toFixed(1) : '-';
+        const Sp = p.S_prime !== null ? p.S_prime.toFixed(1) : '-';
+        const comp = p.completeness !== null ? `${Math.round(p.completeness * 100)}%` : '-';
+        const aff = p.aff ?? '';
+        const title = p.title ?? '';
+        const core = p.isCore ? p.isCore : 'uncertain';
+
+        return `
+          <tr onclick="goDetail('${encodeURIComponent(p.name)}')">
+            <td><span class="rank ${rankClass}">${rank}</span></td>
+            <td>
+              <a class="link" href="detail.html?name=${encodeURIComponent(p.name)}" onclick="event.stopPropagation();">
+                ${escapeHtml(p.name)}
+              </a>
+              <div class="muted">${escapeHtml([aff, title].filter(Boolean).join(' · '))}</div>
+            </td>
+            <td class="mono">${Sp}</td>
+            <td class="mono">${S}</td>
+            <td class="mono hide-sm">${comp}</td>
+            <td class="hide-sm">${escapeHtml(core)}</td>
+          </tr>
+        `;
+      }).join('');
+
+      app.innerHTML = `
+        <table class="table">
+          <thead>
+            <tr>
+              <th style="width:90px;">排名</th>
+              <th>研究者</th>
+              <th style="width:120px;">S'</th>
+              <th style="width:120px;">S</th>
+              <th class="hide-sm" style="width:120px;">完备度</th>
+              <th class="hide-sm" style="width:160px;">是否核心</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows || `<tr><td colspan="6"><div class="loading">无匹配结果</div></td></tr>`}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function goDetail(name) {
+      window.location.href = `detail.html?name=${name}`;
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    // -----------------------------------------
+    // A1: URL 参数初始化（新增）
+    // 支持 index.html?q=xxx&sort=S_prime_desc
+    // -----------------------------------------
+    (function initFromUrl(){
+      const ps = new URLSearchParams(location.search);
+      const q0 = (ps.get('q') || '').trim();
+      const sort0 = (ps.get('sort') || '').trim();
+      if (q0) qInput.value = q0;
+      if (sort0) sortSel.value = sort0;
+    })();
+
+    qInput.addEventListener('input', () => {
+      window.clearTimeout(window.__qTimer);
+      window.__qTimer = window.setTimeout(() => loadPeople(), 200);
+    });
+    sortSel.addEventListener('change', () => loadPeople());
+
+    investigateBtn.addEventListener('click', () => {
+      startInvestigateFlow().catch(err => {
+        app.innerHTML = `<div class="error">任务启动失败：${err.message}</div>`;
+      });
+    });
+
+    loadPeople();
+  </script>
+</body>
+</html>

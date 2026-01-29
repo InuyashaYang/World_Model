@@ -1,0 +1,6 @@
+api_key: "" # DO NOT commit real keys. Use per-request api_key from the web UI.
+base_url: "http://152.53.52.170:3003/v1"
+model_id: "gemini-2.5-pro-deepsearch-async"
+temperature: 0.2
+timeout: 1200
+verify_ssl: true
