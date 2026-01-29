@@ -77,6 +77,17 @@ DEFAULT_RECENT_YEARS = int(os.environ.get("DEFAULT_RECENT_YEARS", "2"))
 DEEPSEARCH_WORKERS = int(os.environ.get("DEEPSEARCH_WORKERS", "5"))
 PROFILE_WORKERS = int(os.environ.get("PROFILE_WORKERS", "10"))
 
+DEEPSEARCH_RETRIES = int(os.environ.get("DEEPSEARCH_RETRIES", "3"))
+DEEPSEARCH_RETRY_BACKOFF_SEC = float(
+    os.environ.get("DEEPSEARCH_RETRY_BACKOFF_SEC", "2")
+)
+DEEPSEARCH_RETRY_BACKOFF_MULT = float(
+    os.environ.get("DEEPSEARCH_RETRY_BACKOFF_MULT", "2")
+)
+DEEPSEARCH_RETRY_JITTER_SEC = float(
+    os.environ.get("DEEPSEARCH_RETRY_JITTER_SEC", "0.5")
+)
+
 
 @app.get("/api/models")
 def api_models() -> JSONResponse:
@@ -1152,48 +1163,129 @@ def _run_deepsearch(
         "\nOutput only the addendum content (no surrounding commentary)."
     ).replace("<<<MATERIALS>>>", materials)
 
+    import random
+    import requests
+
     url = base_url.rstrip("/") + "/chat/completions"
-    chunks: List[str] = []
-    last = time.time()
-    for c in stream_chat(
-        prompt,
-        api_key=api_key,
-        model_id=model_id,
-        url=url,
-        temperature=0.2,
-        timeout=1200,
-        system=system,
-        extra=None,
-    ):
+
+    def _should_stop() -> bool:
         j = _get_job(job_id)
-        if j.cancelled or j.fast_profile:
-            _emit(
-                job_id,
-                {
-                    "type": "cancelled" if j.cancelled else "fast_profile",
-                    "where": "deepsearch",
-                },
-            )
-            break
-        chunks.append(c)
-        now = time.time()
-        if now - last >= 1.0:
+        return bool(j.cancelled or j.fast_profile)
+
+    def _emit_stop(where: str) -> None:
+        j = _get_job(job_id)
+        _emit(
+            job_id,
+            {
+                "type": "cancelled" if j.cancelled else "fast_profile",
+                "where": where,
+            },
+        )
+
+    def _sleep_backoff(sec: float) -> None:
+        # Sleep in small steps so cancel/fast_profile can interrupt.
+        end = time.time() + max(0.0, sec)
+        while time.time() < end:
+            if _should_stop():
+                return
+            time.sleep(min(0.25, end - time.time()))
+
+    attempts = max(1, int(DEEPSEARCH_RETRIES))
+    backoff = max(0.0, float(DEEPSEARCH_RETRY_BACKOFF_SEC))
+    mult = max(1.0, float(DEEPSEARCH_RETRY_BACKOFF_MULT))
+    jitter = max(0.0, float(DEEPSEARCH_RETRY_JITTER_SEC))
+
+    for attempt in range(1, attempts + 1):
+        if _should_stop():
+            _emit_stop("deepsearch")
+            return materials
+
+        chunks: List[str] = []
+        last = time.time()
+        try:
             _emit(
                 job_id,
                 {
                     "type": "log",
-                    "message": f"Deepsearch streaming... ({len(chunks)} chunks)",
+                    "message": f"Deepsearch start (attempt {attempt}/{attempts}) model={model_id}",
                 },
             )
-            last = now
 
-    add = "".join(chunks).strip()
-    if not add:
-        _emit(job_id, {"type": "log", "message": "Deepsearch returned empty"})
-        return materials
+            for c in stream_chat(
+                prompt,
+                api_key=api_key,
+                model_id=model_id,
+                url=url,
+                temperature=0.2,
+                timeout=1200,
+                system=system,
+                extra=None,
+            ):
+                if _should_stop():
+                    _emit_stop("deepsearch")
+                    return materials
+                chunks.append(c)
+                now = time.time()
+                if now - last >= 1.0:
+                    _emit(
+                        job_id,
+                        {
+                            "type": "log",
+                            "message": f"Deepsearch streaming... ({len(chunks)} chunks)",
+                        },
+                    )
+                    last = now
 
-    _emit(job_id, {"type": "log", "message": "Deepsearch completed"})
-    return materials + "\n\n[DeepSearch Addendum]\n" + add
+            add = "".join(chunks).strip()
+            if not add:
+                _emit(job_id, {"type": "log", "message": "Deepsearch returned empty"})
+                return materials
+
+            _emit(job_id, {"type": "log", "message": "Deepsearch completed"})
+            return materials + "\n\n[DeepSearch Addendum]\n" + add
+
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout,
+        ) as e:
+            msg = f"{type(e).__name__}: {e}"
+            if attempt >= attempts:
+                _emit(
+                    job_id,
+                    {
+                        "type": "log",
+                        "message": f"Deepsearch failed after {attempts} attempts: {msg} (skipped)",
+                    },
+                )
+                return materials
+
+            # Retry with backoff.
+            sleep_s = backoff * (mult ** (attempt - 1))
+            if jitter:
+                sleep_s += random.random() * jitter
+            _emit(
+                job_id,
+                {
+                    "type": "log",
+                    "message": f"Deepsearch transient error: {msg} (retry in {sleep_s:.1f}s)",
+                },
+            )
+            _sleep_backoff(sleep_s)
+            continue
+
+        except Exception as e:
+            # Non-retriable unknown error: skip.
+            _emit(
+                job_id,
+                {
+                    "type": "log",
+                    "message": f"Deepsearch unexpected error: {type(e).__name__}: {e} (skipped)",
+                },
+            )
+            return materials
+
+    return materials
 
 
 def _gpt52_parse_topic_plan(
@@ -1623,19 +1715,25 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                 ensure_ascii=False,
                 indent=2,
             )
-            dr_full = _run_deepsearch(
-                name=person_name,
-                materials=base_materials,
-                api_key=api_key,
-                base_url=DEFAULT_BASE_URL,
-                model_id=DEFAULT_MODEL_DEEPSEARCH,
-                job_id=job_id,
-            )
-            add = (
-                dr_full.split("[DeepSearch Addendum]", 1)[-1].strip() if dr_full else ""
-            )
             it2 = dict(it)
-            it2["deepresearch_addendum"] = add
+            try:
+                dr_full = _run_deepsearch(
+                    name=person_name,
+                    materials=base_materials,
+                    api_key=api_key,
+                    base_url=DEFAULT_BASE_URL,
+                    model_id=DEFAULT_MODEL_DEEPSEARCH,
+                    job_id=job_id,
+                )
+                if dr_full and "[DeepSearch Addendum]" in dr_full:
+                    add = dr_full.split("[DeepSearch Addendum]", 1)[-1].strip()
+                else:
+                    add = ""
+                    it2["deepresearch_error"] = "deepsearch_failed_or_empty"
+                it2["deepresearch_addendum"] = add
+            except Exception as e:
+                it2["deepresearch_addendum"] = ""
+                it2["deepresearch_error"] = f"{type(e).__name__}: {e}"
             return it2
 
         done = 0
@@ -1658,6 +1756,8 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                 },
             )
 
+            failed = 0
+            errors_sample: List[str] = []
             for fut in concurrent.futures.as_completed(future_to_idx):
                 j = _get_job(job_id)
                 if j.cancelled or j.fast_profile:
@@ -1674,8 +1774,13 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                         pass
                     break
                 i0 = future_to_idx[fut]
-                it2 = fut.result()
-                enriched_items[i0] = it2
+                try:
+                    it2 = fut.result()
+                    enriched_items[i0] = it2
+                except Exception as e:
+                    failed += 1
+                    if len(errors_sample) < 5:
+                        errors_sample.append(f"{type(e).__name__}: {e}")
                 done += 1
                 _emit(
                     job_id,
@@ -1684,7 +1789,7 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                         "phase": "deepresearch",
                         "done": done,
                         "total": total,
-                        "name": it2.get("name"),
+                        "name": (enriched_items[i0] or {}).get("name"),
                     },
                 )
         finally:
@@ -1703,6 +1808,8 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                     "kind": "deepresearch_done",
                     "topic": topic,
                     "count": len(enriched),
+                    "failed_count": failed,
+                    "errors_sample": errors_sample,
                     "names": [
                         str(x.get("name")) for x in enriched if isinstance(x, dict)
                     ][:50],
@@ -1831,9 +1938,10 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                     model_id=DEFAULT_MODEL_DEEPSEARCH,
                     job_id=job_id,
                 )
-                notes = (
-                    add.split("[DeepSearch Addendum]", 1)[-1].strip() if add else None
-                )
+                if add and "[DeepSearch Addendum]" in add:
+                    notes = add.split("[DeepSearch Addendum]", 1)[-1].strip()
+                else:
+                    notes = None
 
         topic_id = uuid.uuid4().hex
         out_obj = {
