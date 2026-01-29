@@ -1624,6 +1624,7 @@ def _gpt52_parse_topic_plan(
         "{\n"
         '  "topic_name": string,\n'
         '  "definition": string|null,\n'
+        '  "definition_draft": string,\n'
         '  "time_range": {"recent_years": number|null, "start_year": number|null, "end_year": number|null},\n'
         '  "keywords": [string],\n'
         '  "must_terms": [string],\n'
@@ -1635,6 +1636,7 @@ def _gpt52_parse_topic_plan(
         "Constraints:\n"
         "- keywords: 3-10 items, short phrases\n"
         "- if time range not specified, set time_range.recent_years to null (server will default)\n"
+        "- definition_draft: ALWAYS provide a 1-3 sentence draft definition/range in zh-CN with include/exclude hints\n"
         "- missing_fields should include 'definition' if definition is missing/unclear\n"
         "- questions_for_user: ask at most 3 questions\n\n"
         "User input:\n<<<TEXT>>>\n"
@@ -1849,10 +1851,23 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
         ):
             tr["recent_years"] = DEFAULT_RECENT_YEARS
 
-        # If definition missing, ask once.
+        # If definition missing, ask once (but always provide a draft for confirmation).
         missing = plan.get("missing_fields") if isinstance(plan, dict) else None
         missing = missing if isinstance(missing, list) else []
         definition = plan.get("definition")
+        definition_draft = (
+            plan.get("definition_draft") if isinstance(plan, dict) else None
+        )
+        if not isinstance(definition_draft, str) or not definition_draft.strip():
+            # Fallback draft if model didn't provide.
+            definition_draft = (
+                f"【定义草案】这里的“{topic}”指与该主题相关的具身智能/机器人/学习系统研究，"
+                "重点关注可验证的学术贡献（论文/项目/代码/数据集）与可追溯链接；"
+                "默认时间范围为近几年（可按需要扩展），排除纯商业宣传与缺少证据的描述。"
+            )
+            if isinstance(plan, dict):
+                plan["definition_draft"] = definition_draft
+
         need_def = (not definition) or (
             "definition" in [str(x).lower() for x in missing]
         )
@@ -1869,6 +1884,7 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                 "plan": plan,
                 "asked_definition": True,
                 "original_text": topic,
+                "definition_draft": definition_draft,
             }
             _set_job(job)
             questions = plan.get("questions_for_user")
@@ -1882,12 +1898,15 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                     "type": "need_input",
                     "missing_fields": ["definition"],
                     "questions": questions[:3],
+                    "mode": "confirm_definition",
+                    "default_text": definition_draft,
                     "plan_preview": {
                         "topic_name": plan.get("topic_name"),
                         "time_range": plan.get("time_range"),
                         "keywords": plan.get("keywords"),
                         "must_terms": plan.get("must_terms"),
                         "exclude_terms": plan.get("exclude_terms"),
+                        "definition_draft": definition_draft,
                     },
                 },
             )
@@ -2458,6 +2477,17 @@ def continue_job(
 
     original = job.query
     combined = (str(original).strip() + "\n\n" + add_text).strip()
+
+    # If this was a definition confirmation, persist the final definition into plan.
+    try:
+        if isinstance(job.meta, dict) and job.meta.get("asked_definition"):
+            plan = job.meta.get("plan")
+            if isinstance(plan, dict):
+                plan["definition"] = add_text
+                plan["definition_source"] = "user_confirmed"
+                job.meta["plan"] = plan
+    except Exception:
+        pass
     job.status = "queued"
     job.stage = "queued"
     job.query = combined
