@@ -1313,6 +1313,11 @@ def _gpt52_profile_and_score(
     profile_prompt = (
         "You are a researcher information extraction system.\n"
         "Strictly extract information from the provided materials. Do not fabricate.\n"
+        "Language: Output all human-readable text in Simplified Chinese (zh-CN).\n"
+        "- Do NOT translate URLs/DOIs/IDs.\n"
+        "- Do NOT invent a Chinese name.\n"
+        "- For the profile 'name' field: if a verified Chinese name exists in materials, output '中文名（English name）'; otherwise output the English name only.\n"
+        "- Always keep the English name available in aliases if it is not already included.\n"
         "Output a single JSON object with keys: name, aliases, affiliation_current, position_title, "
         "location, email_public, homepage, google_scholar, semantic_scholar, openalex, orcid, dblp, github, "
         "research_keywords, representative_works, world_model_relevance, metrics, community_roles, evidence_links, missing_or_uncertain.\n"
@@ -1324,6 +1329,9 @@ def _gpt52_profile_and_score(
     score_prompt = (
         "You are an academic evaluator for World Models / Embodied AI.\n"
         "Score strictly based on provided materials; missing info must reduce completeness.\n"
+        "Language: Output all human-readable text in Simplified Chinese (zh-CN).\n"
+        "- Do NOT translate URLs/DOIs/IDs.\n"
+        "- Do NOT fabricate evidence.\n"
         "Output a single JSON object containing: name, affiliation, primary_directions, S, S_prime, completeness, "
         "dimensions{impact,field,quality,community,momentum}, dimension_explanations{...}, evidence[], "
         "missing_or_uncertain[], one_line_conclusion.\n"
@@ -1397,6 +1405,11 @@ def _gpt52_update_profile_and_score(
         "- Do NOT fabricate.\n"
         "- Prefer to fill missing fields and replace uncertain placeholders with supported facts.\n"
         "- Keep the same schema for profile and score as existing outputs.\n"
+        "- Language: Output all human-readable text in Simplified Chinese (zh-CN).\n"
+        "- Do NOT translate URLs/DOIs/IDs.\n"
+        "- Do NOT invent a Chinese name.\n"
+        "- For the profile 'name' field: if a verified Chinese name exists in materials, output '中文名（English name）'; otherwise keep the English name only.\n"
+        "- Ensure the English name is preserved in aliases if not already included.\n"
         '- Output ONE JSON object: {"profile": <obj>, "score": <obj>}\n\n'
         "[NAME]\n<<<NAME>>>\n\n"
         "[BASE_MATERIALS]\n<<<BASE>>>\n\n"
