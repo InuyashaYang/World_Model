@@ -393,15 +393,20 @@
 
         if (a.kind === 'result'){
           const topicId = a.topic_id || (session.result && session.result.topic_id);
-          const topicQuery = session.query || '';
-          const url = `index.html?q=${encodeURIComponent(topicQuery)}&sort=S_prime_desc`;
+          const urlTopic = topicId
+            ? `index.html?topic_id=${encodeURIComponent(topicId)}&sort=topic_rank`
+            : `index.html?sort=S_prime_desc`;
+          const urlAll = `index.html?sort=S_prime_desc`;
 
           html += `
             <div class="wm-card" style="border-color:var(--accent);">
               <div class="wm-card-header" style="color:var(--accent);">🏁 Result <span class="muted" style="margin-left:auto;">${esc(when)}</span></div>
               <div class="wm-card-body" style="display:flex; gap:10px; flex-wrap:wrap;">
-                <a class="btn" href="${esc(url)}" target="_blank" style="text-decoration:none;">
-                  打开完整榜单（index.html · profile大表）
+                <a class="btn" href="${esc(urlTopic)}" target="_blank" style="text-decoration:none;">
+                  打开本次结果（50人）
+                </a>
+                <a class="btn" href="${esc(urlAll)}" target="_blank" style="text-decoration:none;">
+                  打开全库榜单
                 </a>
                 ${topicId ? `
                   <button class="btn" type="button" onclick="window.__openTopic('${esc(topicId)}')">

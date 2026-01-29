@@ -21,12 +21,13 @@
      <div class="toolbar">
        <div class="left">
          <input id="q" class="input" placeholder="搜索姓名 / 单位 / 关键词（profile.research_keywords）" />
-         <select id="sort">
-           <option value="S_prime_desc">按 S' 从高到低</option>
-           <option value="S_desc">按 S 从高到低</option>
-           <option value="name_asc">按姓名 A→Z</option>
-         </select>
-       </div>
+          <select id="sort">
+            <option value="S_prime_desc">按 S' 从高到低</option>
+            <option value="S_desc">按 S 从高到低</option>
+            <option value="name_asc">按姓名 A→Z</option>
+            <option value="topic_rank">按本次Topic顺序</option>
+          </select>
+        </div>
         <div class="right">
           <button id="investigateBtn" class="btn">发起调查</button>
           <button id="exportJsonBtn" class="btn">导出 JSON</button>
@@ -77,6 +78,12 @@
     const countBadge = document.getElementById('count');
     const investigateBtn = document.getElementById('investigateBtn');
     const exportJsonBtn = document.getElementById('exportJsonBtn');
+
+    const urlPs = new URLSearchParams(location.search);
+    const topicId = (urlPs.get('topic_id') || '').trim();
+    let topicNamesSet = null;
+    let topicOrderMap = null;
+    let topicTitle = null;
 
     let allPeople = [];
     let lastPeopleItems = [];
@@ -214,21 +221,46 @@
 
     async function loadPeople() {
       try {
+        // If topic_id is present, we first fetch the topic result and then filter people locally.
+        if (topicId && (!topicNamesSet || !topicOrderMap)) {
+          await loadTopicContext(topicId);
+        }
+
         const params = new URLSearchParams();
         const q = (qInput.value || '').trim();
-        if (q) params.set('q', q);
-        params.set('sort', sortSel.value);
+        // topic_id mode: q is local-only filter; do not send to server.
+        if (!topicId) {
+          if (q) params.set('q', q);
+          params.set('sort', sortSel.value);
+        } else {
+          params.set('sort', 'S_prime_desc');
+        }
 
         const res = await fetch(`/api/people?${params.toString()}`);
         if (!res.ok) throw new Error(`API 错误: ${res.status}`);
         const data = await res.json();
 
-        lastPeopleItems = Array.isArray(data.items) ? data.items : [];
-        allPeople = (data.items || []).map(p => normalizePerson(p));
+        const rawItems = Array.isArray(data.items) ? data.items : [];
+        const items = topicId ? rawItems.filter(p => topicNamesSet && topicNamesSet.has(String(p?.name || ''))) : rawItems;
+
+        lastPeopleItems = items;
+        allPeople = items.map(p => normalizePerson(p));
         render();
       } catch (err) {
         app.innerHTML = `<div class="error">加载失败：${err.message}</div>`;
       }
+    }
+
+    async function loadTopicContext(tid) {
+      const res = await fetch(`/api/topics/${encodeURIComponent(tid)}`);
+      if (!res.ok) throw new Error(`Topic 不存在或无法读取: ${res.status}`);
+      const obj = await res.json();
+      const items = Array.isArray(obj.items) ? obj.items : [];
+      const names = items.map(x => String(x?.name || '').trim()).filter(Boolean);
+      topicNamesSet = new Set(names);
+      topicOrderMap = {};
+      for (let i=0;i<names.length;i++) topicOrderMap[names[i]] = i;
+      topicTitle = obj.topic || tid;
     }
 
     function ts() {
@@ -274,12 +306,39 @@
     }
 
     function filterPeople(people) {
-      // Server already filters.
-      return people;
+      const q = (qInput.value || '').trim().toLowerCase();
+      if (!q) return people;
+
+      if (!topicId) {
+        // Server already filters.
+        return people;
+      }
+
+      // topic mode: apply local filter
+      return people.filter(p => {
+        const hay = [
+          p.name,
+          p.aff,
+          p.title,
+          (p.keywords || []).join(' '),
+        ].filter(Boolean).join(' ').toLowerCase();
+        return hay.includes(q);
+      });
     }
 
     function sortPeople(people) {
-      // Server already sorts.
+      const sort = (sortSel.value || '').trim();
+      if (topicId && sort === 'topic_rank' && topicOrderMap) {
+        return [...people].sort((a,b) => {
+          const ia = topicOrderMap[a.name];
+          const ib = topicOrderMap[b.name];
+          if (typeof ia === 'number' && typeof ib === 'number') return ia - ib;
+          if (typeof ia === 'number') return -1;
+          if (typeof ib === 'number') return 1;
+          return 0;
+        });
+      }
+      // Server already sorts for non-topic mode.
       return people;
     }
 
@@ -317,6 +376,7 @@
       }).join('');
 
       app.innerHTML = `
+        ${topicId ? `<div class="badge" style="margin-bottom:10px;">Topic: ${escapeHtml(topicTitle || topicId)} · ${escapeHtml(topicId)}</div>` : ''}
         <table class="table">
           <thead>
             <tr>
@@ -358,13 +418,23 @@
       const sort0 = (ps.get('sort') || '').trim();
       if (q0) qInput.value = q0;
       if (sort0) sortSel.value = sort0;
+      if ((ps.get('topic_id') || '').trim()) {
+        // In topic mode, default sort to topic_rank unless user provided.
+        if (!sort0) sortSel.value = 'topic_rank';
+      }
     })();
 
     qInput.addEventListener('input', () => {
       window.clearTimeout(window.__qTimer);
-      window.__qTimer = window.setTimeout(() => loadPeople(), 200);
+      window.__qTimer = window.setTimeout(() => {
+        if (topicId) render();
+        else loadPeople();
+      }, 200);
     });
-    sortSel.addEventListener('change', () => loadPeople());
+    sortSel.addEventListener('change', () => {
+      if (topicId) render();
+      else loadPeople();
+    });
 
     investigateBtn.addEventListener('click', () => {
       startInvestigateFlow().catch(err => {
