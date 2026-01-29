@@ -307,10 +307,15 @@
       if (kind === 'topic' && session.progress){
         const d = session.progress.deepresearch || {done:0,total:0};
         const p = session.progress.profile || {done:0,total:0};
+        const t = session.progress.detailing || {done:0,total:0,updated:0,failed:0};
         deepPct = d.total ? Math.round(100*d.done/d.total) : 0;
         profPct = p.total ? Math.round(100*p.done/p.total) : 0;
         deepMeta = `${d.done}/${d.total}`;
         profMeta = `${p.done}/${p.total}`;
+        if (session.status === 'detailing') {
+          deepMeta = `detailing ${t.done}/${t.total} · ok ${t.updated} · fail ${t.failed}`;
+          deepPct = t.total ? Math.round(100*t.done/t.total) : 0;
+        }
       }
       return `
         <div class="wm-sticky-header">
@@ -682,13 +687,18 @@
           const tid = d.topic_id;
           upsertSession({
             session_id: sessionId,
-            status: 'done',
-            last_stage: 'done',
+            status: d.detailing ? 'detailing' : 'done',
+            last_stage: d.detailing ? 'detailing' : 'done',
             result: { topic_id: tid, topic: d.topic || query }
           });
           appendArtifact(sessionId, { kind:'result', topic_id: tid, topic: d.topic || query });
           await loadTopicList();
           if (activeSessionId === sessionId) renderSessionView(sessionId);
+
+          if (d.detailing) {
+            appendLog(sessionId, '主流程已完成，后台正在补全（detailing）...');
+            startDetailingWatch(sessionId, tid);
+          }
         } else {
           upsertSession({
             session_id: sessionId,
@@ -706,6 +716,38 @@
         catch (_) { pushBot('错误'); }
       });
       es.addEventListener('eof', () => es.close());
+    }
+
+    async function startDetailingWatch(sessionId, topicId){
+      try{
+        const es = new EventSource(`/api/topics/${encodeURIComponent(topicId)}/events`);
+        es.addEventListener('detail_progress', (e) => {
+          const d = JSON.parse(e.data);
+          const prog = loadSessions().find(x => x && x.session_id === sessionId)?.progress || {};
+          prog.detailing = { done: d.done||0, total: d.total||0, updated: d.updated||0, failed: d.failed||0 };
+          upsertSession({ session_id: sessionId, status:'detailing', last_stage:'detailing', progress: prog });
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+        });
+        es.addEventListener('detail_person_updated', (e) => {
+          const d = JSON.parse(e.data);
+          appendLog(sessionId, `已补全：${d.name || ''}（rev ${d.revision || ''}）`);
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+        });
+        es.addEventListener('detail_done', (e) => {
+          appendLog(sessionId, 'detailing 完成。');
+          upsertSession({ session_id: sessionId, status:'done', last_stage:'done' });
+          try { es.close(); } catch(_){ }
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+        });
+        es.addEventListener('detail_error', (e) => {
+          const d = (() => { try { return JSON.parse(e.data); } catch(_) { return {}; } })();
+          appendLog(sessionId, `detailing 错误：${d.message || ''}`);
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+        });
+        es.addEventListener('eof', () => { try { es.close(); } catch(_){} });
+      }catch(e){
+        appendLog(sessionId, `detailing 订阅失败：${e.message}`);
+      }
     }
 
     // ----------------------------

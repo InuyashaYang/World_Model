@@ -77,6 +77,9 @@ DEFAULT_RECENT_YEARS = int(os.environ.get("DEFAULT_RECENT_YEARS", "2"))
 DEEPSEARCH_WORKERS = int(os.environ.get("DEEPSEARCH_WORKERS", "5"))
 PROFILE_WORKERS = int(os.environ.get("PROFILE_WORKERS", "10"))
 
+DETAILING_DEEPSEARCH_WORKERS = int(os.environ.get("DETAILING_DEEPSEARCH_WORKERS", "2"))
+DETAILING_PROFILE_WORKERS = int(os.environ.get("DETAILING_PROFILE_WORKERS", "2"))
+
 DEEPSEARCH_RETRIES = int(os.environ.get("DEEPSEARCH_RETRIES", "3"))
 DEEPSEARCH_RETRY_BACKOFF_SEC = float(
     os.environ.get("DEEPSEARCH_RETRY_BACKOFF_SEC", "2")
@@ -315,6 +318,12 @@ _jobs_lock = threading.Lock()
 _jobs: Dict[str, Job] = {}
 _job_events: Dict[str, "queue.Queue[dict]"] = {}
 
+_topic_events_lock = threading.Lock()
+_topic_events: Dict[str, "queue.Queue[dict]"] = {}
+
+_topic_detailing_lock = threading.Lock()
+_topic_detailing_state: Dict[str, Dict[str, Any]] = {}
+
 _limit_lock = threading.Lock()
 _active_jobs = 0
 _ip_last_submit: Dict[str, float] = {}
@@ -335,6 +344,32 @@ def _emit(job_id: str, event: Dict[str, Any]) -> None:
         q.put_nowait(payload)
     except Exception:
         pass
+
+
+def _emit_topic(topic_id: str, event: Dict[str, Any]) -> None:
+    with _topic_events_lock:
+        q = _topic_events.get(topic_id)
+    if not q:
+        return
+    payload = {
+        "ts": time.time(),
+        **event,
+    }
+    try:
+        q.put_nowait(payload)
+    except Exception:
+        pass
+
+
+def _set_topic_detailing_state(topic_id: str, patch: Dict[str, Any]) -> None:
+    with _topic_detailing_lock:
+        cur = _topic_detailing_state.get(topic_id) or {}
+        _topic_detailing_state[topic_id] = {**cur, **patch}
+
+
+def _get_topic_detailing_state(topic_id: str) -> Dict[str, Any]:
+    with _topic_detailing_lock:
+        return dict(_topic_detailing_state.get(topic_id) or {})
 
 
 def _set_job(job: Job) -> None:
@@ -898,6 +933,202 @@ def _write_person_output(name: str, person: Dict[str, Any]) -> None:
     (WEB_PEOPLE_DIR / f"{name}.person.json").write_text(text, encoding="utf-8")
 
 
+def _read_person_output(name: str) -> Optional[Dict[str, Any]]:
+    p = PEOPLE_DIR / f"{name}.person.json"
+    if not p.exists():
+        p = WEB_PEOPLE_DIR / f"{name}.person.json"
+        if not p.exists():
+            return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _run_topic_detailing(
+    *,
+    topic_id: str,
+    topic: str,
+    plan: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    api_key: str,
+    base_url: str,
+    model_deepsearch: str,
+    model_gpt: str,
+    deepsearch_enabled: bool,
+) -> None:
+    """Background post-processing:
+
+    - per-person deepresearch (best-effort) + incremental profile update
+    - topic-level deepsearch notes (optional)
+    - emits events via /api/topics/{topic_id}/events
+    """
+    import concurrent.futures
+
+    total = len(items or [])
+    _set_topic_detailing_state(topic_id, {"status": "running", "total": total})
+
+    _emit_topic(topic_id, {"type": "detail_stage", "stage": "deepresearch_people"})
+
+    done = 0
+    updated = 0
+    failed = 0
+
+    def _base_materials(it: Dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                "topic": topic,
+                "definition": plan.get("definition")
+                if isinstance(plan, dict)
+                else None,
+                "time_range": plan.get("time_range")
+                if isinstance(plan, dict)
+                else None,
+                "plan": plan,
+                "candidate": it,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def _one(idx0: int, it: Dict[str, Any]) -> Dict[str, Any]:
+        name0 = str((it.get("name") or "").strip())
+        if not name0:
+            return {"ok": False, "name": name0, "error": "missing name"}
+
+        if not deepsearch_enabled:
+            return {"ok": False, "name": name0, "error": "deepsearch disabled"}
+
+        base_mat = _base_materials(it)
+        dr_full = _run_deepsearch(
+            name=name0,
+            materials=base_mat,
+            api_key=api_key,
+            base_url=base_url,
+            model_id=model_deepsearch,
+            job_id=topic_id,  # not a job; but used for cancellation checks only (no cancel here)
+        )
+        add = ""
+        if dr_full and "[DeepSearch Addendum]" in dr_full:
+            add = dr_full.split("[DeepSearch Addendum]", 1)[-1].strip()
+        if not add:
+            return {"ok": False, "name": name0, "error": "empty addendum"}
+
+        prev = _read_person_output(name0) or {}
+        prev_prof = prev.get("profile")
+        prev_score = prev.get("score")
+
+        upd = _gpt52_update_profile_and_score(
+            name=name0,
+            base_materials=base_mat,
+            deepresearch_addendum=add,
+            previous_profile=prev_prof,
+            previous_score=prev_score,
+            api_key=api_key,
+            base_url=base_url,
+            model_id=model_gpt,
+        )
+
+        rev = int(((prev.get("sources") or {}).get("profile_revision") or 1)) + 1
+        person_obj = {
+            "name": name0,
+            "profile": upd.get("profile"),
+            "score": upd.get("score"),
+            "sources": {
+                **(
+                    (prev.get("sources") or {})
+                    if isinstance(prev.get("sources"), dict)
+                    else {}
+                ),
+                "last_updated_at": time.time(),
+                "profile_revision": rev,
+                "has_deepresearch": True,
+            },
+        }
+        _write_person_output(name0, person_obj)
+        return {"ok": True, "name": name0, "revision": rev}
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, int(DETAILING_DEEPSEARCH_WORKERS))
+    ) as ex:
+        futs = [ex.submit(_one, i, it) for i, it in enumerate(items or [])]
+        for fut in concurrent.futures.as_completed(futs):
+            res = {}
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = {"ok": False, "name": None, "error": f"{type(e).__name__}: {e}"}
+
+            done += 1
+            if res.get("ok"):
+                updated += 1
+                _emit_topic(
+                    topic_id,
+                    {
+                        "type": "detail_person_updated",
+                        "name": res.get("name"),
+                        "revision": res.get("revision"),
+                    },
+                )
+            else:
+                failed += 1
+
+            _set_topic_detailing_state(
+                topic_id,
+                {"done": done, "updated": updated, "failed": failed},
+            )
+            _emit_topic(
+                topic_id,
+                {
+                    "type": "detail_progress",
+                    "done": done,
+                    "total": total,
+                    "updated": updated,
+                    "failed": failed,
+                },
+            )
+
+    # Optional topic-level notes
+    notes = None
+    if deepsearch_enabled:
+        _emit_topic(topic_id, {"type": "detail_stage", "stage": "topic_notes"})
+        try:
+            add = _run_deepsearch(
+                name=topic,
+                materials=json.dumps(
+                    {"topic": topic, "items": items}, ensure_ascii=False, indent=2
+                ),
+                api_key=api_key,
+                base_url=base_url,
+                model_id=model_deepsearch,
+                job_id=topic_id,
+            )
+            if add and "[DeepSearch Addendum]" in add:
+                notes = add.split("[DeepSearch Addendum]", 1)[-1].strip() or None
+        except Exception:
+            notes = None
+
+    if notes:
+        p = TOPICS_DIR / f"{topic_id}.topic.json"
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                obj["notes"] = notes
+                obj["updated_at"] = time.time()
+                p.write_text(
+                    json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+        except Exception:
+            pass
+
+    _set_topic_detailing_state(
+        topic_id,
+        {"status": "done", "finished_at": time.time()},
+    )
+    _emit_topic(topic_id, {"type": "detail_done", "topic_id": topic_id})
+    _emit_topic(topic_id, {"type": "eof"})
+
+
 def _openalex_materials(name: str) -> Dict[str, Any]:
     # Minimal, no-key OpenAlex fetch for V1.
     import requests
@@ -1141,6 +1372,77 @@ def _gpt52_profile_and_score(
     return {"profile": profile, "score": score}
 
 
+def _gpt52_update_profile_and_score(
+    *,
+    name: str,
+    base_materials: str,
+    deepresearch_addendum: str,
+    previous_profile: Any,
+    previous_score: Any,
+    api_key: str,
+    base_url: str,
+    model_id: str,
+) -> Dict[str, Any]:
+    """Incrementally update profile/score using additional evidence.
+
+    The model should preserve schema and only improve/clarify based on new materials.
+    """
+    from core.llm_client import chat
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    system = "You are a meticulous information extraction and evaluation system. Output JSON only."
+    prompt = (
+        "You will UPDATE an existing researcher profile and score using NEW evidence.\n"
+        "Rules:\n"
+        "- Do NOT fabricate.\n"
+        "- Prefer to fill missing fields and replace uncertain placeholders with supported facts.\n"
+        "- Keep the same schema for profile and score as existing outputs.\n"
+        '- Output ONE JSON object: {"profile": <obj>, "score": <obj>}\n\n'
+        "[NAME]\n<<<NAME>>>\n\n"
+        "[BASE_MATERIALS]\n<<<BASE>>>\n\n"
+        "[PREVIOUS_PROFILE]\n<<<PP>>>\n\n"
+        "[PREVIOUS_SCORE]\n<<<PS>>>\n\n"
+        "[DEEPRESEARCH_ADDENDUM]\n<<<ADD>>>\n"
+    )
+    prompt = (
+        prompt.replace("<<<NAME>>>", name)
+        .replace("<<<BASE>>>", base_materials)
+        .replace("<<<PP>>>", json.dumps(previous_profile, ensure_ascii=False, indent=2))
+        .replace("<<<PS>>>", json.dumps(previous_score, ensure_ascii=False, indent=2))
+        .replace("<<<ADD>>>", deepresearch_addendum or "")
+    )
+
+    text = chat(
+        prompt,
+        api_key=api_key,
+        model_id=model_id,
+        url=url,
+        temperature=0.0,
+        timeout=180,
+        system=system,
+        extra={"response_format": {"type": "json_object"}},
+    )
+
+    t = (text or "").strip()
+    try:
+        obj = json.loads(t)
+    except Exception:
+        l = t.find("{")
+        r = t.rfind("}")
+        if l != -1 and r != -1 and r > l:
+            obj = json.loads(t[l : r + 1])
+        else:
+            raise
+    if not isinstance(obj, dict):
+        return {"profile": previous_profile, "score": previous_score}
+    return {
+        "profile": obj.get("profile")
+        if obj.get("profile") is not None
+        else previous_profile,
+        "score": obj.get("score") if obj.get("score") is not None else previous_score,
+    }
+
+
 def _run_deepsearch(
     *,
     name: str,
@@ -1169,11 +1471,18 @@ def _run_deepsearch(
     url = base_url.rstrip("/") + "/chat/completions"
 
     def _should_stop() -> bool:
-        j = _get_job(job_id)
-        return bool(j.cancelled or j.fast_profile)
+        # job_id can be a real job (normal path) or a topic_id (detailing path).
+        try:
+            j = _get_job(job_id)
+            return bool(j.cancelled or j.fast_profile)
+        except Exception:
+            return False
 
     def _emit_stop(where: str) -> None:
-        j = _get_job(job_id)
+        try:
+            j = _get_job(job_id)
+        except Exception:
+            return
         _emit(
             job_id,
             {
@@ -1684,8 +1993,8 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
         except Exception:
             pass
 
-        # Mandatory: deepresearch each Top50 person BEFORE profile extraction.
-        job.stage = "deepresearch_people"
+        # Fast path: generate initial profiles first (no deepresearch blocking).
+        job.stage = "profile_people"
         _set_job(job)
         _emit(job_id, {"type": "stage", "stage": job.stage})
 
@@ -1693,155 +2002,27 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
 
         items = lb.get("items") or []
         total_items = len(items)
-        enriched_items: List[Optional[Dict[str, Any]]] = [None] * total_items
 
-        def _do_one_deep(idx0: int, it: Dict[str, Any]) -> Dict[str, Any]:
-            j = _get_job(job_id)
-            if j.cancelled or j.fast_profile:
-                return dict(it)
+        # ---- Initial profiles (fast) ----
+        def _do_one_profile_fast(it: Dict[str, Any]) -> Dict[str, Any]:
             person_name = (it.get("name") or "").strip()
+            base_materials_obj = {
+                "topic": topic,
+                "definition": plan.get("definition")
+                if isinstance(plan, dict)
+                else None,
+                "time_range": plan.get("time_range")
+                if isinstance(plan, dict)
+                else None,
+                "plan": plan,
+                "candidate": it,
+            }
             base_materials = json.dumps(
-                {
-                    "topic": topic,
-                    "definition": plan.get("definition")
-                    if isinstance(plan, dict)
-                    else None,
-                    "time_range": plan.get("time_range")
-                    if isinstance(plan, dict)
-                    else None,
-                    "plan": plan,
-                    "candidate": it,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            it2 = dict(it)
-            try:
-                dr_full = _run_deepsearch(
-                    name=person_name,
-                    materials=base_materials,
-                    api_key=api_key,
-                    base_url=DEFAULT_BASE_URL,
-                    model_id=DEFAULT_MODEL_DEEPSEARCH,
-                    job_id=job_id,
-                )
-                if dr_full and "[DeepSearch Addendum]" in dr_full:
-                    add = dr_full.split("[DeepSearch Addendum]", 1)[-1].strip()
-                else:
-                    add = ""
-                    it2["deepresearch_error"] = "deepsearch_failed_or_empty"
-                it2["deepresearch_addendum"] = add
-            except Exception as e:
-                it2["deepresearch_addendum"] = ""
-                it2["deepresearch_error"] = f"{type(e).__name__}: {e}"
-            return it2
-
-        done = 0
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=DEEPSEARCH_WORKERS)
-        future_to_idx: Dict[concurrent.futures.Future, int] = {}
-        try:
-            for i0, it in enumerate(items):
-                if not (it.get("name") or "").strip():
-                    continue
-                future_to_idx[ex.submit(_do_one_deep, i0, it)] = i0
-
-            total = len(future_to_idx)
-            _emit(
-                job_id,
-                {
-                    "type": "progress",
-                    "phase": "deepresearch",
-                    "done": 0,
-                    "total": total,
-                },
-            )
-
-            failed = 0
-            errors_sample: List[str] = []
-            for fut in concurrent.futures.as_completed(future_to_idx):
-                j = _get_job(job_id)
-                if j.cancelled or j.fast_profile:
-                    _emit(
-                        job_id,
-                        {
-                            "type": "cancelled" if j.cancelled else "fast_profile",
-                            "where": "deepresearch_people",
-                        },
-                    )
-                    try:
-                        ex.shutdown(wait=False, cancel_futures=True)
-                    except Exception:
-                        pass
-                    break
-                i0 = future_to_idx[fut]
-                try:
-                    it2 = fut.result()
-                    enriched_items[i0] = it2
-                except Exception as e:
-                    failed += 1
-                    if len(errors_sample) < 5:
-                        errors_sample.append(f"{type(e).__name__}: {e}")
-                done += 1
-                _emit(
-                    job_id,
-                    {
-                        "type": "progress",
-                        "phase": "deepresearch",
-                        "done": done,
-                        "total": total,
-                        "name": (enriched_items[i0] or {}).get("name"),
-                    },
-                )
-        finally:
-            try:
-                ex.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-
-        enriched = [x for x in enriched_items if x]
-
-        try:
-            _emit(
-                job_id,
-                {
-                    "type": "artifact",
-                    "kind": "deepresearch_done",
-                    "topic": topic,
-                    "count": len(enriched),
-                    "failed_count": failed,
-                    "errors_sample": errors_sample,
-                    "names": [
-                        str(x.get("name")) for x in enriched if isinstance(x, dict)
-                    ][:50],
-                },
-            )
-        except Exception:
-            pass
-
-        job.stage = "profile_people"
-        _set_job(job)
-        _emit(job_id, {"type": "stage", "stage": job.stage})
-
-        def _do_one_profile(it: Dict[str, Any]) -> Dict[str, Any]:
-            person_name = (it.get("name") or "").strip()
-            materials = json.dumps(
-                {
-                    "topic": topic,
-                    "definition": plan.get("definition")
-                    if isinstance(plan, dict)
-                    else None,
-                    "time_range": plan.get("time_range")
-                    if isinstance(plan, dict)
-                    else None,
-                    "plan": plan,
-                    "candidate": it,
-                },
-                ensure_ascii=False,
-                indent=2,
+                base_materials_obj, ensure_ascii=False, indent=2
             )
             out = _gpt52_profile_and_score(
                 name=person_name,
-                materials=materials,
+                materials=base_materials,
                 api_key=api_key,
                 base_url=DEFAULT_BASE_URL,
                 model_id=DEFAULT_MODEL_GPT52,
@@ -1852,10 +2033,13 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                 "score": out.get("score"),
                 "sources": {
                     "created_at": time.time(),
+                    "last_updated_at": time.time(),
+                    "profile_revision": 1,
                     "pipeline_topic": topic,
                     "base_url": DEFAULT_BASE_URL,
                     "model_gpt": DEFAULT_MODEL_GPT52,
                     "model_deepsearch": DEFAULT_MODEL_DEEPSEARCH,
+                    "has_deepresearch": False,
                 },
             }
             _write_person_output(person_name, person_obj)
@@ -1865,19 +2049,17 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
 
         prof_done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=PROFILE_WORKERS) as ex:
-            if _get_job(job_id).cancelled:
-                enriched = []
-                _emit(job_id, {"type": "cancelled", "where": "before_profile"})
-
-            if _get_job(job_id).fast_profile:
-                _emit(job_id, {"type": "fast_profile", "where": "before_profile"})
-
-            futs = [ex.submit(_do_one_profile, it) for it in enriched]
+            futs = [
+                ex.submit(_do_one_profile_fast, it)
+                for it in items
+                if (it.get("name") or "").strip()
+            ]
             total = len(futs)
             _emit(
                 job_id,
                 {"type": "progress", "phase": "profile", "done": 0, "total": total},
             )
+
             enriched2: List[Dict[str, Any]] = []
             for fut in concurrent.futures.as_completed(futs):
                 if _get_job(job_id).cancelled:
@@ -1897,7 +2079,7 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
                     },
                 )
 
-        # Keep deterministic ordering by score (already sorted) then fill by name match.
+        # Keep deterministic ordering by original score then fill by name match.
         by_name = {str(x.get("name")): x for x in enriched2}
         ordered: List[Dict[str, Any]] = []
         for it in items:
@@ -1923,25 +2105,8 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
         except Exception:
             pass
 
+        # Notes are deferred to detailing.
         notes = None
-        if deepsearch and not _get_job(job_id).fast_profile:
-            job.stage = "deepsearch"
-            _set_job(job)
-            _emit(job_id, {"type": "stage", "stage": job.stage})
-            if not _get_job(job_id).cancelled:
-                # Deepsearch: ask for an audit-friendly synthesis and extra evidence.
-                add = _run_deepsearch(
-                    name=topic,
-                    materials=json.dumps(lb, ensure_ascii=False, indent=2),
-                    api_key=api_key,
-                    base_url=DEFAULT_BASE_URL,
-                    model_id=DEFAULT_MODEL_DEEPSEARCH,
-                    job_id=job_id,
-                )
-                if add and "[DeepSearch Addendum]" in add:
-                    notes = add.split("[DeepSearch Addendum]", 1)[-1].strip()
-                else:
-                    notes = None
 
         topic_id = uuid.uuid4().hex
         out_obj = {
@@ -1978,6 +2143,23 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
         }
         _write_topic_result(topic_id, out_obj)
 
+        # Start detailing after the main job is done (non-blocking).
+        _set_topic_detailing_state(
+            topic_id,
+            {
+                "status": "running",
+                "done": 0,
+                "total": len(lb.get("items") or []),
+                "updated": 0,
+                "failed": 0,
+                "started_at": time.time(),
+                "finished_at": None,
+            },
+        )
+        _emit_topic(
+            topic_id, {"type": "detail_stage", "stage": "started", "topic_id": topic_id}
+        )
+
         try:
             _emit(
                 job_id,
@@ -1995,7 +2177,40 @@ def _run_topic_job(job_id: str, *, topic: str, api_key: str, deepsearch: bool) -
         job.stage = "done"
         job.result_topic_id = topic_id
         _set_job(job)
-        _emit(job_id, {"type": "done", "topic_id": topic_id, "topic": topic})
+
+        _emit(
+            job_id,
+            {
+                "type": "done",
+                "topic_id": topic_id,
+                "topic": topic,
+                "detailing": True,
+            },
+        )
+
+        # Background detailing thread.
+        def _detail_thread() -> None:
+            try:
+                _run_topic_detailing(
+                    topic_id=topic_id,
+                    topic=topic,
+                    plan=plan,
+                    items=lb.get("items") or [],
+                    api_key=api_key,
+                    base_url=DEFAULT_BASE_URL,
+                    model_deepsearch=DEFAULT_MODEL_DEEPSEARCH,
+                    model_gpt=DEFAULT_MODEL_GPT52,
+                    deepsearch_enabled=bool(deepsearch),
+                )
+            except Exception as e:
+                _emit_topic(
+                    topic_id,
+                    {"type": "detail_error", "message": f"{type(e).__name__}: {e}"},
+                )
+
+        threading.Thread(
+            target=_detail_thread, name=f"detail-{topic_id}", daemon=True
+        ).start()
     except Exception as e:
         job.status = "error"
         job.stage = "error"
@@ -2267,7 +2482,40 @@ def api_topic(topic_id: str) -> JSONResponse:
         obj = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         raise HTTPException(status_code=500, detail="invalid topic json")
+    st = _get_topic_detailing_state(topic_id)
+    if st:
+        obj = {**obj, "detailing": st}
     return JSONResponse(obj)
+
+
+@app.get("/api/topics/{topic_id}/events")
+def topic_events(topic_id: str) -> StreamingResponse:
+    p = TOPICS_DIR / f"{topic_id}.topic.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="topic not found")
+
+    with _topic_events_lock:
+        q = _topic_events.get(topic_id)
+        if not q:
+            q = queue.Queue(maxsize=2000)
+            _topic_events[topic_id] = q
+
+    def gen() -> Generator[bytes, None, None]:
+        yield b"event: hello\ndata: {}\n\n"
+        while True:
+            try:
+                ev = q.get(timeout=25)
+            except Exception:
+                yield b": keep-alive\n\n"
+                continue
+
+            typ = ev.get("type") or "event"
+            data = json.dumps(ev, ensure_ascii=False)
+            yield f"event: {typ}\ndata: {data}\n\n".encode("utf-8")
+            if typ == "eof":
+                break
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 def _job_to_public(job: Job) -> Dict[str, Any]:
