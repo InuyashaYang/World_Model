@@ -612,6 +612,13 @@
       const es = new EventSource(`/api/jobs/${jobId}/events`);
       let prog = { deepresearch: {done:0,total:0}, profile: {done:0,total:0} };
 
+      function stopSession(status, stage, message){
+        syncSession({ status, last_stage: stage || status });
+        if (message) appendLog(sessionId, message);
+        try { es.close(); } catch (_) {}
+        if (activeSessionId === sessionId) renderSessionView(sessionId);
+      }
+
       function syncSession(patch){
         upsertSession({ session_id: sessionId, ...patch });
         if (activeSessionId === sessionId) renderSessionView(sessionId);
@@ -653,6 +660,18 @@
         await continueJob(jobId, apiKey, text);
         syncSession({ status:'running', last_stage:'queued' });
         await watchJob(jobId, kind, query + "\n\n" + text);
+      });
+
+      es.addEventListener('cancelled', (e) => {
+        stopSession('cancelled', 'cancelled', '已取消（best-effort）：可能仍有少量在途请求正在收尾。');
+      });
+
+      es.addEventListener('fast_profile', (e) => {
+        const d = (() => { try { return JSON.parse(e.data); } catch(_) { return {}; } })();
+        // Keep running but reflect stage so UI doesn't look stuck.
+        syncSession({ last_stage: 'fast_profile' });
+        appendLog(sessionId, `已请求 fast_profile（${d.where || 'signal'}）`);
+        if (activeSessionId === sessionId) renderSessionView(sessionId);
       });
 
       es.addEventListener('done', async (e) => {
@@ -715,7 +734,9 @@
         if (!s || !s.job_id) return;
         appendLog(sid, '请求取消...');
         await cancelJob(s.job_id);
-        appendLog(sid, '取消请求已发送。');
+        // Optimistically update UI; server will also send SSE cancelled.
+        upsertSession({ session_id: sid, status:'cancelled', last_stage:'cancelled' });
+        appendLog(sid, '取消请求已发送（best-effort），等待任务收尾...');
         if (activeSessionId === sid) renderSessionView(sid);
       }catch(e){
         pushBot(`取消失败：${e.message}`);
