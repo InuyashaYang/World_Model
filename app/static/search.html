@@ -637,7 +637,27 @@
     // ----------------------------
     async function watchJob(jobId, kind, query){
       const sessionId = activeSessionId;
-      const es = new EventSource(`/api/jobs/${jobId}/events`);
+      const debugEnabled = (new URLSearchParams(location.search).get('debug') === '1');
+      function dbg(msg, obj){
+        if (!debugEnabled) return;
+        const line = `[debug ${new Date().toLocaleTimeString()}] ${msg}`;
+        appendLog(sessionId, line + (obj ? ` ${JSON.stringify(obj)}` : ''));
+        try { console.log(line, obj || ''); } catch (_) {}
+      }
+
+      async function fetchJson(url, opts){
+        const t0 = performance.now();
+        const res = await fetch(url, opts || {});
+        const ms = Math.round(performance.now() - t0);
+        let body = null;
+        try { body = await res.json(); } catch(_) {}
+        return { ok: res.ok, status: res.status, ms, body };
+      }
+
+      let es = new EventSource(`/api/jobs/${jobId}/events`);
+      dbg('SSE connect', { url: `/api/jobs/${jobId}/events` });
+      let reconnecting = false;
+      let retry = 0;
       let prog = { deepresearch: {done:0,total:0}, profile: {done:0,total:0} };
 
       function stopSession(status, stage, message){
@@ -645,6 +665,35 @@
         if (message) appendLog(sessionId, message);
         try { es.close(); } catch (_) {}
         if (activeSessionId === sessionId) renderSessionView(sessionId);
+      }
+
+      async function handleSseError(){
+        if (reconnecting) return;
+        reconnecting = true;
+        dbg('SSE error; checking job', { jobId, retry });
+
+        const chk = await fetchJson(`/api/jobs/${encodeURIComponent(jobId)}`);
+        dbg('Job check', chk);
+        if (chk.status === 404){
+          upsertSession({ session_id: sessionId, status:'stale', last_stage:'stale', job_id:'' });
+          appendLog(sessionId, '连接中断且任务已失效（服务重启/实例切换）。请重新发起任务。');
+          try { es.close(); } catch(_) {}
+          reconnecting = false;
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+          return;
+        }
+
+        // Backoff reconnect
+        retry = Math.min(retry + 1, 6);
+        const waitMs = Math.min(30000, 1000 * (2 ** (retry - 1)));
+        appendLog(sessionId, `SSE 连接中断，${Math.round(waitMs/1000)}s 后尝试重连...`);
+        await new Promise(r => setTimeout(r, waitMs));
+
+        try { es.close(); } catch(_) {}
+        es = new EventSource(`/api/jobs/${jobId}/events`);
+        dbg('SSE reconnect', { waitMs });
+        es.onerror = () => handleSseError();
+        reconnecting = false;
       }
 
       function syncSession(patch){
@@ -765,11 +814,59 @@
         catch (_) { pushBot('错误'); }
       });
       es.addEventListener('eof', () => es.close());
+
+      es.onerror = () => {
+        handleSseError().catch(err => {
+          dbg('SSE error handler failed', { message: err.message || String(err) });
+        });
+      };
     }
 
     async function startDetailingWatch(sessionId, topicId){
       try{
-        const es = new EventSource(`/api/topics/${encodeURIComponent(topicId)}/events`);
+        const debugEnabled = (new URLSearchParams(location.search).get('debug') === '1');
+        function dbg(msg, obj){
+          if (!debugEnabled) return;
+          const line = `[debug ${new Date().toLocaleTimeString()}] ${msg}`;
+          appendLog(sessionId, line + (obj ? ` ${JSON.stringify(obj)}` : ''));
+          try { console.log(line, obj || ''); } catch (_) {}
+        }
+
+        async function fetchJson(url, opts){
+          const t0 = performance.now();
+          const res = await fetch(url, opts || {});
+          const ms = Math.round(performance.now() - t0);
+          let body = null;
+          try { body = await res.json(); } catch(_) {}
+          return { ok: res.ok, status: res.status, ms, body };
+        }
+
+        let es = new EventSource(`/api/topics/${encodeURIComponent(topicId)}/events`);
+        dbg('Detail SSE connect', { topicId });
+        let reconnecting = false;
+        let retry = 0;
+
+        async function handleSseError(){
+          if (reconnecting) return;
+          reconnecting = true;
+          const chk = await fetchJson(`/api/topics/${encodeURIComponent(topicId)}`);
+          dbg('Topic check', chk);
+          if (chk.status === 404){
+            appendLog(sessionId, 'detailing 连接中断且 topic 不存在。');
+            try { es.close(); } catch(_){}
+            reconnecting = false;
+            return;
+          }
+          retry = Math.min(retry + 1, 6);
+          const waitMs = Math.min(30000, 1000 * (2 ** (retry - 1)));
+          appendLog(sessionId, `detailing 连接中断，${Math.round(waitMs/1000)}s 后尝试重连...`);
+          await new Promise(r => setTimeout(r, waitMs));
+          try { es.close(); } catch(_){}
+          es = new EventSource(`/api/topics/${encodeURIComponent(topicId)}/events`);
+          dbg('Detail SSE reconnect', { waitMs });
+          es.onerror = () => handleSseError();
+          reconnecting = false;
+        }
         es.addEventListener('detail_progress', (e) => {
           const d = JSON.parse(e.data);
           const prog = loadSessions().find(x => x && x.session_id === sessionId)?.progress || {};
@@ -794,6 +891,12 @@
           if (activeSessionId === sessionId) renderSessionView(sessionId);
         });
         es.addEventListener('eof', () => { try { es.close(); } catch(_){} });
+
+        es.onerror = () => {
+          handleSseError().catch(err => {
+            dbg('Detail SSE error handler failed', { message: err.message || String(err) });
+          });
+        };
       }catch(e){
         appendLog(sessionId, `detailing 订阅失败：${e.message}`);
       }

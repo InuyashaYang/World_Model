@@ -2446,7 +2446,6 @@ def create_topic_job(
 def continue_job(
     job_id: str, request: Request, payload: Dict[str, Any] = Body(...)
 ) -> JSONResponse:
-    global _active_jobs
     job = _get_job(job_id)
     if job.status != "waiting_user":
         raise HTTPException(status_code=400, detail="job not waiting for input")
@@ -2461,11 +2460,8 @@ def continue_job(
         raise HTTPException(status_code=400, detail="api_key too long")
 
     # Continuing an existing job should not be blocked by IP_COOLDOWN_SEC.
-    # Still respect global concurrency.
-    with _limit_lock:
-        if _active_jobs >= MAX_CONCURRENT_JOBS:
-            raise HTTPException(status_code=429, detail="too many active jobs")
-        _active_jobs += 1
+    # Also, it should not consume an additional active-job slot because the job already exists.
+    # We keep the global limiter in create_* endpoints.
 
     original = job.query
     combined = (str(original).strip() + "\n\n" + add_text).strip()
