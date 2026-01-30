@@ -467,6 +467,10 @@
         btnFastProfile.onclick = null;
         btnCancel.onclick = null;
       }
+
+      if (s.status === 'stale'){
+        pushBot('该任务已失效（服务重启/实例切换导致），请重新发起。');
+      }
     }
 
     // ----------------------------
@@ -598,7 +602,14 @@
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ api_key: apiKey, text })
       });
-      if (!res.ok) throw new Error(`继续失败: ${res.status}`);
+      if (!res.ok) {
+        let detail = '';
+        try {
+          const j = await res.json();
+          detail = j && (j.detail || j.message) ? ` (${j.detail || j.message})` : '';
+        } catch (_) {}
+        throw new Error(`继续失败: ${res.status}${detail}`);
+      }
       return await res.json();
     }
 
@@ -610,7 +621,14 @@
 
     async function cancelJob(jobId){
       const res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method:'POST' });
-      if (!res.ok) throw new Error(`取消失败: ${res.status}`);
+      if (!res.ok) {
+        let detail = '';
+        try {
+          const j = await res.json();
+          detail = j && (j.detail || j.message) ? ` (${j.detail || j.message})` : '';
+        } catch (_) {}
+        throw new Error(`取消失败: ${res.status}${detail}`);
+      }
       return await res.json();
     }
 
@@ -681,9 +699,21 @@
           syncSession({ status:'waiting_user', last_stage:'need_input' });
           return;
         }
-        await continueJob(jobId, apiKey, text);
-        syncSession({ status:'running', last_stage:'queued' });
-        await watchJob(jobId, kind, query + "\n\n" + text);
+        try {
+          await continueJob(jobId, apiKey, text);
+          syncSession({ status:'running', last_stage:'queued' });
+          await watchJob(jobId, kind, query + "\n\n" + text);
+        } catch (err) {
+          appendLog(sessionId, `继续失败：${err.message}`);
+          // If server lost the job, mark session stale to avoid repeated confusion.
+          if (String(err.message || '').includes('404')) {
+            upsertSession({ session_id: sessionId, status:'stale', last_stage:'stale', job_id:'' });
+            appendLog(sessionId, '任务已失效（服务重启/实例切换导致）。请重新发起任务。');
+          } else {
+            syncSession({ status:'waiting_user', last_stage:'need_input' });
+          }
+          if (activeSessionId === sessionId) renderSessionView(sessionId);
+        }
       });
 
       es.addEventListener('cancelled', (e) => {

@@ -2460,19 +2460,11 @@ def continue_job(
     if len(api_key) > 200:
         raise HTTPException(status_code=400, detail="api_key too long")
 
-    # Rate guardrail (same IP).
-    client_ip = request.client.host if request.client else "unknown"
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        client_ip = fwd.split(",")[0].strip() or client_ip
+    # Continuing an existing job should not be blocked by IP_COOLDOWN_SEC.
+    # Still respect global concurrency.
     with _limit_lock:
         if _active_jobs >= MAX_CONCURRENT_JOBS:
             raise HTTPException(status_code=429, detail="too many active jobs")
-        last = _ip_last_submit.get(client_ip)
-        now = time.time()
-        if last and (now - last) < IP_COOLDOWN_SEC:
-            raise HTTPException(status_code=429, detail="too many requests")
-        _ip_last_submit[client_ip] = now
         _active_jobs += 1
 
     original = job.query
